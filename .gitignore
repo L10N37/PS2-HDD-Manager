@@ -1,0 +1,21 @@
+/build/
+/.vs/
+/.vscode/
+*.user
+*.user.*
+*.obj
+*.o
+*.exe
+*.dll
+*.zip
+
+# Locally prepared third-party formatter resources.
+/payload/fhdb/*
+!/payload/fhdb/README.md
+/tools/pfsshell/source/
+/tools/pfsshell/bin/
+/payload/runtime/*
+!/payload/runtime/README.md
+/tools/freedvdboot/source/
+/tools/hdl-dump/source/
+/tools/hdl-dump/bin/
