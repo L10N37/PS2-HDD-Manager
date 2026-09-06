@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(PS2HDDManager VERSION 0.5.0 LANGUAGES CXX)
+project(PS2HDDManager VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,6 +17,8 @@ add_library(ps2hddcore STATIC
     src/core/OplConfig.h
     src/core/Ps2Apa.cpp
     src/core/Ps2Apa.h
+    src/core/Ps2ApaBank.cpp
+    src/core/Ps2ApaBank.h
     src/core/Ps2HddLayout.cpp
     src/core/Ps2HddLayout.h
     src/core/Ps2HddFormat.cpp

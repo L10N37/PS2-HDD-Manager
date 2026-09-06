@@ -1,0 +1,13 @@
+0.1.0-alpha 4TB hardware-test update
+
+The guarded formatter now accepts an existing non-system MBR/GPT disk directly.
+After the existing typed ERASE /dev/sdX confirmation, the privileged writer:
+  1. re-checks exact device identity/capacity/system-disk safety,
+  2. refuses active swap or kernel block-device holders,
+  3. automatically unmounts ordinary filesystems on child partitions,
+  4. clears primary/backup MBR/GPT partition-table signatures internally,
+  5. asks the kernel to reread the now-empty partition table,
+  6. verifies host partition count is zero,
+  7. begins the normal PS2 APA/PFS or Extended APA Banks transaction.
+
+No manual wipefs/pre-format step is required.

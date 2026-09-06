@@ -19,3 +19,13 @@
 /tools/freedvdboot/source/
 /tools/hdl-dump/source/
 /tools/hdl-dump/bin/
+build/
+build-*/
+.cache/
+payload/runtime/
+*.tar.gz
+.post4tb-fix-backup-*/
+.bank-queue-progress-backup-*/
+.total-velocity-marking-v4-backup-*/
+.live-queue-v5-backup-*/
+.mixed-bank-queue-v6-backup-*/

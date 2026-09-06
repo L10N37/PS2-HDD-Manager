@@ -8,6 +8,7 @@
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QFile>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFileInfo>
@@ -41,8 +42,8 @@ Ps2HddSetupDialog::Ps2HddSetupDialog(PrivilegedSession *session, QWidget *parent
 
     auto *layout = new QVBoxLayout(this);
     auto *notice = new QLabel(
-            "0.5.0-alpha keeps the >2 TiB banked layout preview-only. The standard <=2 TiB path "
-            "fast-formats APA/PFS and can provision a plug-and-play OPL/FHDB environment. Backends "
+            "0.1.0-alpha experimental 4 TB test: Extended APA Banks creates a conventional bootable Bank 0 "
+            "plus games-only Bank 1+. OPL/PFS/FHDB stay in Bank 0 and the GUI can target either bank. Backends "
             "and downloads are persistently cached. FHDB still requires the console EEPROM HDD-boot "
             "setting to be enabled once per console.",
             this);
@@ -55,7 +56,7 @@ Ps2HddSetupDialog::Ps2HddSetupDialog(PrivilegedSession *session, QWidget *parent
     layoutMode = new QComboBox(options);
     layoutMode->addItem("Standard APA / PFS (current OPL, up to 2 TiB)",
             static_cast<int>(Ps2::HddLayoutMode::StandardApa));
-    layoutMode->addItem("Future extended APA banks (>2 TiB preview only)",
+    layoutMode->addItem("Extended APA banks (>2 TiB experimental hardware test)",
             static_cast<int>(Ps2::HddLayoutMode::ExtendedApaBanks));
     optionLayout->addRow("Disk layout:", layoutMode);
     auto *stageInfo = new QLabel(
@@ -160,6 +161,13 @@ Ps2HddSetupDialog::Ps2HddSetupDialog(PrivilegedSession *session, QWidget *parent
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     connect(diskList, &QTreeWidget::itemSelectionChanged, this, &Ps2HddSetupDialog::updateSelection);
     connect(layoutMode, &QComboBox::currentIndexChanged, this, [this]() {
+        const bool extended = selectedMode() == Ps2::HddLayoutMode::ExtendedApaBanks;
+        installOplCheck->setText(extended
+                ? "Install Open PS2 Loader Extended APA (required for Bank 1+)"
+                : "Install latest official OPL Beta (recommended)");
+        if (extended)
+            installOplCheck->setChecked(true);
+        installOplCheck->setEnabled(!extended);
         refreshRows();
         updateSelection();
         updateWriteButton();
@@ -224,11 +232,16 @@ void Ps2HddSetupDialog::evaluateSafety(Candidate &candidate)
     else if ((disk.size % Ps2::HddLayoutPlanner::SectorSize) != 0) candidate.safetyMessage = "Capacity is not sector-aligned.";
     else if (disk.busType == "Virtual" || disk.busType == "File-backed virtual" || disk.busType == "Storage Spaces") candidate.safetyMessage = "Virtual and Storage Spaces disks are refused.";
     else if (disk.readOnly) candidate.safetyMessage = "Disk is write-protected.";
-    else if (disk.partitionCount != 0) candidate.safetyMessage = "Formatter requires a RAW/APA disk with no host-visible partitions.";
     else if (disk.containsSystemVolume) candidate.safetyMessage = "REFUSED: running operating-system disk.";
     else if (disk.containsBootPartition) candidate.safetyMessage = "REFUSED: active/EFI system partition.";
     else if (!disk.systemDiskCheckAvailable) candidate.safetyMessage = "REFUSED: system-disk check unavailable.";
-    else { candidate.eligible = true; candidate.safetyMessage = "Eligible for the guarded Fedora formatter."; }
+    else {
+        candidate.eligible = true;
+        candidate.safetyMessage = disk.partitionCount == 0
+                ? "Eligible for the guarded Fedora formatter."
+                : QString("Eligible. %1 existing host partition(s) will be unmounted and erased automatically after the final ERASE confirmation.")
+                        .arg(disk.partitionCount);
+    }
 }
 
 QString Ps2HddSetupDialog::apaSummary(const Candidate &candidate)
@@ -339,12 +352,14 @@ void Ps2HddSetupDialog::updateWriteButton()
     bool enabled = false;
 #ifdef __linux__
     const QList<QTreeWidgetItem*> selected = diskList->selectedItems();
-    if (backendReady && selected.size() == 1 && selectedMode() == Ps2::HddLayoutMode::StandardApa) {
+    if (backendReady && selected.size() == 1) {
         const std::size_t index = static_cast<std::size_t>(selected.first()->data(0, Qt::UserRole).toULongLong());
         if (index < candidates.size()) {
             const Candidate &candidate = candidates[index];
             const Ps2::HddLayout plan = Ps2::HddLayoutPlanner::Plan(candidate.disk.size, selectedMode());
-            enabled = candidate.eligible && plan.valid && plan.unaddressedSectorCount == 0;
+            const bool standardFits = selectedMode() != Ps2::HddLayoutMode::StandardApa ||
+                    candidate.disk.size / Ps2::HddLayoutPlanner::SectorSize <= Ps2::HddLayoutPlanner::MaximumApaSectorCount;
+            enabled = candidate.eligible && plan.valid && standardFits;
         }
     }
 #endif
@@ -418,19 +433,22 @@ void Ps2HddSetupDialog::formatSelectedDisk()
     if (index >= candidates.size()) return;
     const Candidate &candidate = candidates[index];
     const Ps2::HddLayout plan = Ps2::HddLayoutPlanner::Plan(candidate.disk.size, selectedMode());
-    if (!candidate.eligible || !plan.valid || plan.unaddressedSectorCount != 0 ||
-            selectedMode() != Ps2::HddLayoutMode::StandardApa) return;
+    if (!candidate.eligible || !plan.valid) return;
+    const bool extended = selectedMode() == Ps2::HddLayoutMode::ExtendedApaBanks;
+    if (!extended && candidate.disk.size / Ps2::HddLayoutPlanner::SectorSize > Ps2::HddLayoutPlanner::MaximumApaSectorCount) return;
 
     const Ps2::ProvisioningSelection provision = provisioningSelection();
     const QString device = QString::fromStdString(candidate.disk.devicePath);
+    const QString layoutDescription = extended
+            ? QString("Extended APA Banks: Bank 0 is the conventional boot/system/PFS/FHDB bank; "
+                      "Bank 1+ are independent games-only APA banks. Every bank is verified after creation.")
+            : QString("Standard Sony/PS2 APA/PFS: one conventional Bank 0 with the four system PFS partitions.");
     QString warning = QString(
             "THIS ERASES THE ENTIRE DISK.\n\nTarget: %1\nModel: %2\nCapacity: %3 (%4 bytes)\n\n"
-            "The fast formatter will create a fresh standard Sony/PS2 APA layout, format the four "
-            "system PFS partitions, then verify the linked APA chain and mount every system PFS partition.\n\n"
-            "Selected optional setup: %5")
+            "%5\n\nSelected optional setup: %6")
             .arg(device).arg(QString::fromStdString(candidate.disk.model))
             .arg(formatBytes(candidate.disk.size)).arg(QString::number(candidate.disk.size))
-            .arg(provisioningSummary());
+            .arg(layoutDescription).arg(provisioningSummary());
     if (provision.installFhdb)
         warning += "\n\nFHDB WARNING: the HDD files/bootstrap will be installed, but the console EEPROM HDD-boot setting must still be enabled once. Use the included Status / Enable / Disable / Verify utility from OPL/FMCB.";
     if (createFreeDvdBootCheck->isChecked())
@@ -451,7 +469,7 @@ void Ps2HddSetupDialog::formatSelectedDisk()
     refreshButton->setEnabled(false); writeButton->setEnabled(false);
 
     QStringList fetchArguments;
-    if (provision.installOpl) fetchArguments << "--opl";
+    if (provision.installOpl && !extended) fetchArguments << "--opl";
     if (provision.installWlaunchElf) fetchArguments << "--wle";
     if (provision.installMemoryCardAnnihilator) fetchArguments << "--mca";
     if (provision.installFhdb) fetchArguments << "--fhdb";
@@ -470,10 +488,29 @@ void Ps2HddSetupDialog::formatSelectedDisk()
         }
     }
 
+    if (extended && provision.installOpl) {
+        const QString root = QString::fromLocal8Bit(PS2_HDD_PROJECT_ROOT);
+        const QString source = root + "/payload/banked-opl/OPNPS2LD.ELF";
+        const QString destination = payloadPath + "/opl/OPNPS2LD.ELF";
+        if (!QFileInfo(source).isFile()) {
+            refreshButton->setEnabled(true); refreshBackendState();
+            QMessageBox::critical(this, "Bank-aware OPL missing", "Bundled bank-aware OPL test ELF is missing. Disk was not modified.");
+            return;
+        }
+        QDir().mkpath(QFileInfo(destination).absolutePath());
+        QFile::remove(destination);
+        if (!QFile::copy(source, destination)) {
+            refreshButton->setEnabled(true); refreshBackendState();
+            QMessageBox::critical(this, "Bank-aware OPL staging failed", "Could not stage the bundled bank-aware OPL test ELF. Disk was not modified.");
+            return;
+        }
+    }
+
     QStringList arguments;
     arguments << "--device" << device
               << "--expected-size" << QString::number(candidate.disk.size)
               << "--pfsshell" << pfsshellPath;
+    if (extended) arguments << "--extended-banks";
     if (provision.any()) {
         arguments << "--payload-dir" << payloadPath;
         if (provision.installOpl) arguments << "--install-opl";
@@ -484,9 +521,32 @@ void Ps2HddSetupDialog::formatSelectedDisk()
         if (provision.installHddBootEnabler) arguments << "--install-hdd-enabler";
     }
 
-    if (!runWriterWithStatus(arguments,
-            "Fast-formatting standard APA/PFS. Do not disconnect the disk...", &output)) {
-        refreshButton->setEnabled(true); refreshBackendState();
+    for (;;) {
+        output.clear();
+        const bool writerOk = runWriterWithStatus(arguments,
+                extended ? "Formatting Bank 0 + games-only upper APA banks. Do not disconnect the disk..." :
+                           "Fast-formatting standard APA/PFS. Do not disconnect the disk...", &output);
+        if (writerOk) break;
+
+        if (output.contains("TARGET_BUSY:")) {
+            const QString busy = output.mid(output.lastIndexOf("TARGET_BUSY:")).right(5000);
+            const auto choice = QMessageBox::warning(this, "Target drive is still in use",
+                    busy + "\n\nClose the listed application/window, then click Retry. "
+                           "No lazy/forced unmount is used.",
+                    QMessageBox::Retry | QMessageBox::Cancel,
+                    QMessageBox::Retry);
+            if (choice == QMessageBox::Retry)
+                continue;
+
+            refreshButton->setEnabled(true);
+            refreshBackendState();
+            statusLabel->setText("Formatting cancelled while waiting for the target drive to become idle.");
+            scanDisks();
+            return;
+        }
+
+        refreshButton->setEnabled(true);
+        refreshBackendState();
         statusLabel->setText("Formatter failed. Review the writer output before doing anything else.");
         QMessageBox::critical(this, "PS2 HDD formatting failed",
                 "The writer stopped and reported an error:\n\n" + output.right(9000));
@@ -515,9 +575,15 @@ void Ps2HddSetupDialog::formatSelectedDisk()
     }
 
     refreshButton->setEnabled(true); refreshBackendState();
-    statusLabel->setText("Standard APA/PFS format and selected setup completed and verified.");
-    QString done = "The standard APA chain and all four system PFS partitions verified successfully.";
-    if (provision.installOpl) done += "\n\nLatest OPL Beta was installed and PP.FHDB.APPS was configured as OPL's HDD data/app partition.";
+    statusLabel->setText(extended ? "Extended APA banks and selected setup completed and verified."
+                                  : "Standard APA/PFS format and selected setup completed and verified.");
+    QString done = extended
+            ? "Bank 0 and every games-only upper APA bank verified successfully. Bank 0 contains the normal PS2 system/PFS/FHDB layout."
+            : "The standard APA chain and all four system PFS partitions verified successfully.";
+    if (provision.installOpl)
+        done += extended
+                ? "\n\nThe bundled bank-aware OPL test ELF was installed and PP.FHDB.APPS was configured as OPL's Bank-0 data/app partition."
+                : "\n\nLatest OPL Beta was installed and PP.FHDB.APPS was configured as OPL's HDD data/app partition.";
     if (provision.configureOplPlugAndPlay) done += "\nOPL was preconfigured for automatic Internal HDD startup, HDD games as the default device, artwork, write operations, caching and auto-refresh/sort. IGR exit_path was left at OPL's safe default.";
     if (provision.installWlaunchElf) done += "\nLatest normal wLaunchELF_ISR was installed.";
     if (provision.installMemoryCardAnnihilator) done += "\nMemory Card Annihilator was installed in OPL Apps.";
@@ -548,7 +614,7 @@ QString Ps2HddSetupDialog::candidateDetails(const Candidate &candidate) const
         details += "\n\nPlanned layout:";
         for (const Ps2::ApaBankLayout &bank : plan.banks) {
             const QString role = bank.role == Ps2::ApaBankRole::BootSystemAndGames ?
-                    "standard APA system + games" : "future games-only bank";
+                    "standard APA system + games" : "games-only APA bank";
             details += QString("\n  Bank %1: physical LBA 0x%2, %3 addressable — %4")
                     .arg(bank.index).arg(QString::number(bank.baseSector, 16).toUpper())
                     .arg(formatBytes(bank.addressableSectorCount * Ps2::HddLayoutPlanner::SectorSize)).arg(role);
@@ -556,7 +622,7 @@ QString Ps2HddSetupDialog::candidateDetails(const Candidate &candidate) const
         if (selectedMode() == Ps2::HddLayoutMode::StandardApa) {
             details += "\n  Fast write: canonical APA + verified PFS system partitions.";
             details += "\n  Optional setup: " + provisioningSummary() + ".";
-        } else details += "\n  >2 TiB banks remain design-preview only until the 2 TB hardware baseline passes.";
+        } else details += "\n  Extended mode creates these banks; OPL/PFS/FHDB remain in Bank 0.";
         if (plan.unaddressedSectorCount != 0)
             details += "\n  Outside this layout: " + formatBytes(plan.unaddressedSectorCount * Ps2::HddLayoutPlanner::SectorSize) + ".";
         details += "\n  " + QString::fromStdString(plan.message);

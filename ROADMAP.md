@@ -1,6 +1,6 @@
 # Development roadmap
 
-## Stage 1 — standard <=2 TiB automation baseline (current, 0.5.0-alpha)
+## Stage 1 — standard <=2 TiB automation baseline (current, 0.1.0-alpha)
 
 Completed/implemented for hardware testing:
 

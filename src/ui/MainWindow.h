@@ -3,6 +3,7 @@
 
 #include <QMainWindow>
 #include <QStringList>
+#include <QHash>
 #include <QSet>
 #include <vector>
 
@@ -96,9 +97,12 @@ private:
     QComboBox *pcDriveCombo = nullptr;
     QLineEdit *pcPath = nullptr;
     QComboBox *diskCombo = nullptr;
+    QComboBox *gameBankCombo = nullptr;
     QTreeWidget *ps2View = nullptr;
     QLabel *statusLabel = nullptr;
+    QLabel *overallProgressDetail = nullptr;
     QLabel *progressDetail = nullptr;
+    QProgressBar *overallProgress = nullptr;
     QProgressBar *transferProgress = nullptr;
     QPushButton *copyToPs2Button = nullptr;
     QPushButton *applyOplDefaultsButton = nullptr;
@@ -115,6 +119,12 @@ private:
     QString currentOplPartition;
     QString currentOplBase;
     QSet<QString> markedPcPaths;
+    QHash<QString, int> queuedPcBanks;
+    quint64 batchTotalBytes = 0;
+    quint64 batchCompletedBytes = 0;
+    quint64 batchCurrentBytes = 0;
+    int batchCurrentIndex = 0;
+    int batchGameCount = 0;
     PrivilegedSession *privilegedSession = nullptr;
     QNetworkAccessManager *network = nullptr;
 };

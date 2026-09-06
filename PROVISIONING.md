@@ -1,4 +1,4 @@
-# 0.5.0-alpha provisioning
+# 0.1.0-alpha provisioning
 
 All application selections are optional. The format operation always creates and verifies the standard
 APA/PFS system layout first, then performs the selected provisioning transaction.
@@ -62,7 +62,7 @@ installed normally.
 
 ### IGR / exit path
 
-0.5 deliberately does not manufacture a direct HDD `exit_path`. Current OPL's EE IGR path loads a
+The initial alpha deliberately does not manufacture a direct HDD `exit_path`. Current OPL's EE IGR path loads a
 custom exit ELF with `LoadElf()` after an IOP reset, but only initializes basic modules (and USB modules
 for a `mass:` target); it does not initialize HDD/PFS first. Until a tested HDD-return loader is added,
 leaving `exit_path` unset is safer than generating a broken `hdd0:...:pfs:` return path.

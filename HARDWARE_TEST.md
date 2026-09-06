@@ -1,8 +1,8 @@
-# PS2 HDD Manager 0.5.0-alpha hardware test
+# PS2 HDD Manager 0.1.0-alpha hardware test
 
 ## What this test is for
 
-0.3 proved the fast 2 TB format and ordinary HDL game write on real hardware. 0.5 tests the complete
+Earlier hardware tests proved the fast 2 TB format and ordinary HDL game write on real hardware. The initial alpha tests the complete
 day-to-day manager workflow: one-time Linux authentication, persistent red transfer marks, live installed-
 game view, built-in artwork downloads, OPL PFS file copy, plug-and-play OPL settings, Memory Card
 Annihilator and the replacement standalone FHDB EEPROM utility.
@@ -16,11 +16,11 @@ user. Do not use sudo:
 
 ```sh
 cd ~/Downloads
-chmod +x ./Install-PS2-HDD-Manager-0.5.0-alpha-Fedora.sh
-./Install-PS2-HDD-Manager-0.5.0-alpha-Fedora.sh
+chmod +x ./prepare_fedora_test.sh
+./prepare_fedora_test.sh --run
 ```
 
-On the first 0.5 run a host backend may need to be built. Later runs should report cache hits from:
+On the first initial-alpha run a host backend may need to be built. Later runs should report cache hits from:
 
 `~/.cache/ps2-hdd-manager`
 
@@ -128,7 +128,7 @@ After copying ART, launch OPL and verify covers are displayed without manually e
 
 ## 8. Memory Card Annihilator
 
-For a freshly provisioned 0.5 disk, verify under OPL Apps:
+For a freshly provisioned initial-alpha disk, verify under OPL Apps:
 
 `Memory Card Annihilator`
 

@@ -52,6 +52,9 @@
 #include <QStatusBar>
 #include <QStorageInfo>
 #include <QStyledItemDelegate>
+#include <QWidget>
+#include <QStyle>
+#include <QPalette>
 #include <QTemporaryFile>
 #include <QTimer>
 #include <QTextStream>
@@ -103,10 +106,10 @@ QString cleanMachineField(QString value)
 
 QString normalizedLocalPath(const QString &path)
 {
-    QFileInfo info(path);
-    QString key = info.canonicalFilePath();
-    if (key.isEmpty()) key = info.absoluteFilePath();
-    return QDir::cleanPath(key);
+    const QFileInfo info(path);
+    if (!info.exists())
+        return QString();
+    return QDir::cleanPath(info.absoluteFilePath());
 }
 
 class MarkedFileDelegate final : public QStyledItemDelegate
@@ -115,19 +118,36 @@ public:
     MarkedFileDelegate(QFileSystemModel *model, const QSet<QString> *marked, QObject *parent)
         : QStyledItemDelegate(parent), model(model), marked(marked) {}
 
-    void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
+    void paint(QPainter *painter, const QStyleOptionViewItem &option,
+            const QModelIndex &index) const override
     {
-        QStyleOptionViewItem adjusted(option);
-        if (model && marked) {
-            const QModelIndex rowIndex = index.sibling(index.row(), 0);
-            const QString path = normalizedLocalPath(model->filePath(rowIndex));
-            if (marked->contains(path)) {
-                adjusted.backgroundBrush = QColor(150, 20, 20, 175);
-                adjusted.palette.setColor(QPalette::Text, Qt::white);
-                adjusted.palette.setColor(QPalette::HighlightedText, Qt::white);
-            }
+        const QModelIndex rowIndex = index.sibling(index.row(), 0);
+        const QString path = model ? normalizedLocalPath(model->filePath(rowIndex)) : QString();
+
+        if (!model || !marked || !marked->contains(path)) {
+            QStyledItemDelegate::paint(painter, option, index);
+            return;
         }
-        QStyledItemDelegate::paint(painter, adjusted, index);
+
+        const bool dark = option.palette.color(QPalette::Base).lightness() < 128;
+        QStyleOptionViewItem markedOption(option);
+        initStyleOption(&markedOption, index);
+
+        const QColor background = dark
+                ? QColor(139, 38, 48)
+                : QColor(255, 205, 205);
+        const QColor foreground = dark
+                ? QColor(255, 255, 255)
+                : QColor(105, 0, 16);
+
+        markedOption.state &= ~QStyle::State_Selected;
+        markedOption.backgroundBrush = background;
+        markedOption.palette.setColor(QPalette::Text, foreground);
+        markedOption.palette.setColor(QPalette::WindowText, foreground);
+
+        const QWidget *widget = markedOption.widget;
+        QStyle *style = widget ? widget->style() : QApplication::style();
+        style->drawControl(QStyle::CE_ItemViewItem, &markedOption, painter, widget);
     }
 
 private:
@@ -269,6 +289,11 @@ void MainWindow::buildUi()
 
     auto *commandBar = new QHBoxLayout();
     commandBar->addStretch();
+    commandBar->addWidget(new QLabel("Game destination:", central));
+    gameBankCombo = new QComboBox(central);
+    gameBankCombo->setMinimumWidth(270);
+    gameBankCombo->addItem("Bank 0", 0);
+    commandBar->addWidget(gameBankCombo);
     copyToPs2Button = new QPushButton("F5  Install selected game(s)  →  PS2 HDD", central);
     copyToPs2Button->setShortcut(QKeySequence(QStringLiteral("F5")));
     copyToPs2Button->setToolTip("Installs selected PS2 disc images as normal HDL APA game partitions.");
@@ -276,18 +301,25 @@ void MainWindow::buildUi()
     commandBar->addStretch();
     layout->addLayout(commandBar);
 
+    overallProgressDetail = new QLabel(central);
+    overallProgressDetail->setVisible(false);
+    overallProgress = new QProgressBar(central);
+    overallProgress->setRange(0, 100);
+    overallProgress->setValue(0);
+    overallProgress->setVisible(false);
     transferProgress = new QProgressBar(central);
     transferProgress->setRange(0, 100);
     transferProgress->setValue(0);
     transferProgress->setVisible(false);
     progressDetail = new QLabel(central);
+    progressDetail->setWordWrap(true);
     progressDetail->setVisible(false);
-    layout->addWidget(transferProgress);
+    layout->addWidget(overallProgressDetail);
+    layout->addWidget(overallProgress);
     layout->addWidget(progressDetail);
+    layout->addWidget(transferProgress);
 
-    statusLabel = new QLabel(
-            "The right pane shows the real installed HDL game table and OPL PFS storage. "
-            "Drop games on HDL Games; drop ART/CFG/APPS folders onto OPL Storage.", central);
+    statusLabel = new QLabel("Ready.", central);
     statusLabel->setWordWrap(true);
     layout->addWidget(statusLabel);
     setCentralWidget(central);
@@ -335,11 +367,14 @@ QWidget *MainWindow::buildPcPane()
     pcView = new QTreeView(group);
     pcView->setModel(pcModel);
     pcView->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    pcView->setContextMenuPolicy(Qt::NoContextMenu);
     pcView->viewport()->installEventFilter(this);
     pcView->setItemDelegate(new MarkedFileDelegate(pcModel, &markedPcPaths, pcView));
     pcView->setDragEnabled(true);
     pcView->setDragDropMode(QAbstractItemView::DragOnly);
     pcView->setSelectionBehavior(QAbstractItemView::SelectRows);
+    pcView->setAlternatingRowColors(false);
+    pcView->setUniformRowHeights(true);
     pcView->setSortingEnabled(true);
     pcView->sortByColumn(0, Qt::AscendingOrder);
     pcView->setRootIsDecorated(false);
@@ -347,9 +382,102 @@ QWidget *MainWindow::buildPcPane()
     pcView->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     for (int i = 1; i < 4; i++) pcView->header()->setSectionResizeMode(i, QHeaderView::ResizeToContents);
     layout->addWidget(pcView, 1);
-    layout->addWidget(new QLabel(
-            "Fedora mount points are listed above. Ctrl/Shift selection works normally; RIGHT-CLICK toggles persistent red transfer marks. "
-            "F5 uses red-marked games first, otherwise the normal selection. Drag files/folders to the PS2 pane for PFS copy.", group));
+    auto *queueBar = new QHBoxLayout();
+    auto *addSelectedToQueue = new QPushButton("Add Selected to Queue", group);
+    auto *unmarkAll = new QPushButton("Unmark All", group);
+    addSelectedToQueue->setToolTip("Append the currently selected PS2 disc images to the persistent transfer queue.");
+    unmarkAll->setToolTip("Clear all persistent transfer marks / queued games.");
+    queueBar->addWidget(addSelectedToQueue);
+    queueBar->addWidget(unmarkAll);
+    queueBar->addStretch();
+    layout->addLayout(queueBar);
+
+    connect(addSelectedToQueue, &QPushButton::clicked, this, [this]() {
+        if (!pcView || !pcView->selectionModel())
+            return;
+
+        if (!gameBankCombo || gameBankCombo->currentIndex() < 0 ||
+                gameBankCombo->currentData().toInt() < 0) {
+            statusBar()->showMessage(
+                    "Choose an explicit destination bank before adding games to the queue.");
+            return;
+        }
+
+        const int queueBank = gameBankCombo->currentData().toInt();
+
+        QSet<QString> selectedPaths;
+        const QModelIndexList indexes =
+                pcView->selectionModel()->selectedIndexes();
+
+        for (const QModelIndex &index : indexes) {
+            if (!index.isValid())
+                continue;
+
+            const QModelIndex row = index.sibling(index.row(), 0);
+            const QString path = normalizedLocalPath(pcModel->filePath(row));
+            const QFileInfo info(path);
+
+            if (info.isFile() && isDiscImagePath(path))
+                selectedPaths.insert(path);
+        }
+
+        if (selectedPaths.isEmpty() && pcView->currentIndex().isValid()) {
+            const QModelIndex row =
+                    pcView->currentIndex().sibling(pcView->currentIndex().row(), 0);
+            const QString path = normalizedLocalPath(pcModel->filePath(row));
+            const QFileInfo info(path);
+
+            if (info.isFile() && isDiscImagePath(path))
+                selectedPaths.insert(path);
+        }
+
+        int added = 0;
+        int reassigned = 0;
+
+        for (const QString &path : selectedPaths) {
+            if (!markedPcPaths.contains(path)) {
+                markedPcPaths.insert(path);
+                queuedPcBanks.insert(path, queueBank);
+                ++added;
+            } else if (queuedPcBanks.value(path, queueBank) != queueBank) {
+                queuedPcBanks.insert(path, queueBank);
+                ++reassigned;
+            }
+        }
+
+        pcView->viewport()->update();
+        pcView->update();
+        updateMarkedStatus();
+
+        QString message;
+        if (added > 0)
+            message += QString("Added %1 game(s) to Bank %2 queue.")
+                    .arg(added).arg(queueBank);
+        if (reassigned > 0) {
+            if (!message.isEmpty())
+                message += " ";
+            message += QString("Reassigned %1 queued game(s) to Bank %2.")
+                    .arg(reassigned).arg(queueBank);
+        }
+
+        if (message.isEmpty())
+            message = "No new supported PS2 disc images were added to the queue.";
+
+        statusBar()->showMessage(message);
+    });
+
+    connect(unmarkAll, &QPushButton::clicked, this, [this]() {
+        markedPcPaths.clear();
+        queuedPcBanks.clear();
+
+        if (pcView) {
+            pcView->viewport()->update();
+            pcView->update();
+        }
+
+        updateMarkedStatus();
+        statusBar()->showMessage("Transfer queue cleared.");
+    });
 
     connect(pcDriveCombo, &QComboBox::currentIndexChanged, this, [this](int index) {
         if (index >= 0) navigatePc(pcDriveCombo->itemData(index).toString());
@@ -396,16 +524,14 @@ QWidget *MainWindow::buildPs2Pane()
     ps2View->viewport()->setAcceptDrops(true);
     ps2View->viewport()->installEventFilter(this);
     ps2View->setSelectionMode(QAbstractItemView::ExtendedSelection);
-    ps2View->setColumnCount(4);
-    ps2View->setHeaderLabels({ "Name", "Game ID / Type", "Media", "Size" });
+    ps2View->setColumnCount(5);
+    ps2View->setHeaderLabels({ "Name", "Game ID / Type", "Media", "Size", "Bank" });
     ps2View->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     ps2View->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     ps2View->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     ps2View->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    ps2View->header()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
     layout->addWidget(ps2View, 1);
-    layout->addWidget(new QLabel(
-            "HDL Games/CD/DVD are virtual categories; games remain normal APA HDL partitions. "
-            "OPL Storage exposes the real PFS files. Drop an ART folder onto OPL Storage to merge it automatically.", group));
 
     connect(refresh, &QPushButton::clicked, this, [this]() {
         if (unlockHddSession(true)) refreshCurrentPs2Tree();
@@ -519,6 +645,15 @@ void MainWindow::selectDisk(int index)
         ps2View->clear(); return;
     }
     populatePs2Tree(disks[static_cast<std::size_t>(index)]);
+    if (gameBankCombo) {
+        const int previous = gameBankCombo->currentData().toInt();
+        gameBankCombo->clear();
+            const auto plan = Ps2::HddLayoutPlanner::Plan(disks[static_cast<std::size_t>(index)].size, Ps2::HddLayoutMode::ExtendedApaBanks);
+        for (const auto &bank : plan.banks)
+            gameBankCombo->addItem(QString("Bank %1 — starts at %2 TiB").arg(bank.index).arg(bank.index * 2), static_cast<int>(bank.index));
+        const int restore = gameBankCombo->findData(previous);
+        gameBankCombo->setCurrentIndex(restore >= 0 ? restore : 0);
+    }
     if (copyToPs2Button) copyToPs2Button->setEnabled(selectedDiskCanInstallGames());
 }
 
@@ -618,17 +753,24 @@ void MainWindow::populateInstalledGames(QTreeWidgetItem *gamesRoot, const Ps2::P
         if (!line.startsWith("GAME\t")) continue;
         const QStringList f = line.split('\t');
         if (f.size() < 5) continue;
-        const QString media = cleanMachineField(f[1]);
+        const bool banked = f.size() >= 6 && f[1] != "DVD" && f[1] != "CD";
+        const int bank = banked ? cleanMachineField(f[1]).toInt() : 0;
+        const int mediaIndex = banked ? 2 : 1;
+        const int sizeIndex = banked ? 3 : 2;
+        const int startupIndex = banked ? 4 : 3;
+        const int nameIndex = banked ? 5 : 4;
+        const QString media = cleanMachineField(f[mediaIndex]);
         bool ok = false;
-        const qulonglong kb = cleanMachineField(f[2]).toULongLong(&ok);
-        const QString startup = cleanMachineField(f[3]);
-        const QString name = cleanMachineField(f.mid(4).join(" "));
+        const qulonglong kb = cleanMachineField(f[sizeIndex]).toULongLong(&ok);
+        const QString startup = cleanMachineField(f[startupIndex]);
+        const QString name = cleanMachineField(f.mid(nameIndex).join(" "));
         QTreeWidgetItem *parent = media == "CD" ? cd : dvd;
         auto *item = new QTreeWidgetItem(parent);
         item->setText(0, name);
         item->setText(1, startup);
         item->setText(2, media);
         item->setText(3, ok ? formatBytes(static_cast<std::uint64_t>(kb) * 1024ULL) : QString());
+        item->setText(4, QString("Bank %1").arg(bank));
         item->setData(0, KindRole, NodeGame);
         count++;
     }
@@ -715,9 +857,6 @@ bool MainWindow::selectedDiskCanInstallGames(QString *reason) const
             !disk.systemDiskCheckAvailable || disk.containsSystemVolume || disk.containsBootPartition || disk.partitionCount != 0) {
         if (reason) *reason = "Selected disk does not pass the guarded raw-disk safety checks."; return false;
     }
-    if (disk.size / Ps2::HddLayoutPlanner::SectorSize > Ps2::HddLayoutPlanner::BankBoundarySectors) {
-        if (reason) *reason = "Physical write access above the first 2 TiB APA bank is not enabled yet."; return false;
-    }
     return true;
 #else
     if (reason) *reason = "Physical PS2 HDD access is currently Fedora/Linux only.";
@@ -762,12 +901,39 @@ bool MainWindow::probeGameImage(const QString &path, QString *media, QString *de
 
 void MainWindow::toggleMarkedPcPath(const QModelIndex &index)
 {
-    if (!index.isValid() || !pcModel) return;
-    const QString path = normalizedLocalPath(pcModel->filePath(index.sibling(index.row(), 0)));
-    if (path.isEmpty() || !QFileInfo::exists(path)) return;
-    if (markedPcPaths.contains(path)) markedPcPaths.remove(path);
-    else markedPcPaths.insert(path);
-    if (pcView) pcView->viewport()->update();
+    if (!index.isValid() || !pcModel)
+        return;
+
+    const QString path = normalizedLocalPath(
+            pcModel->filePath(index.sibling(index.row(), 0)));
+    const QFileInfo info(path);
+
+    if (path.isEmpty() || !info.isFile() || !isDiscImagePath(path)) {
+        statusBar()->showMessage(
+                "Only supported PS2 disc images can be added to the transfer queue.");
+        return;
+    }
+
+    if (markedPcPaths.contains(path)) {
+        markedPcPaths.remove(path);
+        queuedPcBanks.remove(path);
+    } else {
+        if (!gameBankCombo || gameBankCombo->currentIndex() < 0 ||
+                gameBankCombo->currentData().toInt() < 0) {
+            statusBar()->showMessage(
+                    "Choose an explicit destination bank before adding a game to the queue.");
+            return;
+        }
+
+        const int bank = gameBankCombo->currentData().toInt();
+        markedPcPaths.insert(path);
+        queuedPcBanks.insert(path, bank);
+    }
+
+    if (pcView) {
+        pcView->viewport()->update();
+        pcView->update();
+    }
     updateMarkedStatus();
 }
 
@@ -791,13 +957,37 @@ QStringList MainWindow::markedOrSelectedPcPaths() const
 void MainWindow::updateMarkedStatus()
 {
     if (markedPcPaths.isEmpty()) {
-        if (copyToPs2Button) copyToPs2Button->setText("F5  Install selected game(s)  →  PS2 HDD");
-        statusBar()->showMessage("No red transfer marks. Ctrl/Shift selection works normally; right-click toggles a persistent red mark.");
-    } else {
-        if (copyToPs2Button) copyToPs2Button->setText(QString("F5  Install %1 red-marked item(s)  →  PS2 HDD").arg(markedPcPaths.size()));
-        statusBar()->showMessage(QString("%1 PC item(s) marked in red for the next transfer. Right-click again to unmark.")
-                .arg(markedPcPaths.size()));
+        if (copyToPs2Button)
+            copyToPs2Button->setText(
+                    "F5  Install selected game(s)  →  PS2 HDD");
+
+        statusBar()->showMessage(
+                "Transfer queue empty. Select a bank, then right-click or Add Selected to Queue.");
+        return;
     }
+
+    QMap<int, int> perBank;
+    for (const QString &path : markedPcPaths) {
+        const int bank = queuedPcBanks.value(path, -1);
+        if (bank >= 0)
+            perBank[bank] += 1;
+    }
+
+    QStringList bankSummary;
+    for (auto it = perBank.cbegin(); it != perBank.cend(); ++it)
+        bankSummary << QString("Bank %1: %2")
+                .arg(it.key())
+                .arg(it.value());
+
+    if (copyToPs2Button)
+        copyToPs2Button->setText(
+                QString("F5  Install queue (%1 game(s))  →  PS2 HDD")
+                        .arg(markedPcPaths.size()));
+
+    statusBar()->showMessage(
+            QString("%1 game(s) queued — %2")
+                    .arg(markedPcPaths.size())
+                    .arg(bankSummary.join("  |  ")));
 }
 
 void MainWindow::installSelectedPcGames()
@@ -960,11 +1150,15 @@ void MainWindow::addArtwork()
     progress.setWindowTitle("Add OPL Artwork");
     progress.setWindowModality(Qt::WindowModal);
     progress.setMinimumDuration(0);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+    progress.setMinimumWidth(760);
+    progress.resize(820, 220);
 
     QStringList localFiles;
-    int downloaded = 0, cached = 0, missing = 0;
+    int downloaded = 0, cached = 0, optionalScreenshotsMissing = 0, otherUnavailable = 0;
     int step = 0;
-    QStringList missingExamples;
+    QStringList unavailableExamples;
     for (const InstalledGameRef &game : targets) {
         for (const QString &type : types) {
             progress.setLabelText(QString("%1\n%2 — %3").arg(game.name, game.gameId, type));
@@ -984,9 +1178,14 @@ void MainWindow::addArtwork()
                 localFiles << cachePath;
                 if (existed) cached++; else downloaded++;
             } else {
-                missing++;
-                if (missingExamples.size() < 8)
-                    missingExamples << QString("%1 %2 (%3)").arg(game.gameId, type, error);
+                const bool optionalScreenshot404 = type.startsWith("SCR") && error == "HTTP 404";
+                if (optionalScreenshot404) {
+                    optionalScreenshotsMissing++;
+                } else {
+                    otherUnavailable++;
+                    if (unavailableExamples.size() < 8)
+                        unavailableExamples << QString("%1 %2 (%3)").arg(game.gameId, type, error);
+                }
             }
         }
     }
@@ -994,8 +1193,12 @@ void MainWindow::addArtwork()
     progress.close();
 
     if (localFiles.isEmpty()) {
-        QMessageBox::information(this, "No artwork found",
-                QString("No requested artwork was available for the selected games.\n\nMissing/unavailable: %1").arg(missing));
+        QString message = "No requested artwork files were available for the selected games.";
+        if (optionalScreenshotsMissing)
+            message += QString("\n\nOptional screenshots not present in the artwork database: %1").arg(optionalScreenshotsMissing);
+        if (otherUnavailable)
+            message += QString("\nOther artwork unavailable/download errors: %1").arg(otherUnavailable);
+        QMessageBox::information(this, "No artwork found", message);
         return;
     }
     localFiles.removeDuplicates();
@@ -1014,14 +1217,21 @@ void MainWindow::addArtwork()
         return;
     }
     const auto &disk = disks[static_cast<std::size_t>(diskIndex)];
-    transferProgress->setRange(0, 0);
-    transferProgress->setVisible(true);
-    progressDetail->setVisible(true);
-    progressDetail->setText(QString("Installing %1 artwork file(s) into %2...").arg(fileCount).arg(artPath));
+    QProgressDialog writeProgress(QString("Writing %1 artwork file(s) directly into %2...\n\nThe download/cache stage is complete; this stage writes the prepared batch to the PS2 HDD.")
+            .arg(fileCount).arg(artPath), QString(), 0, 0, this);
+    writeProgress.setWindowTitle("Installing OPL Artwork");
+    writeProgress.setWindowModality(Qt::WindowModal);
+    writeProgress.setMinimumDuration(0);
+    writeProgress.setCancelButton(nullptr);
+    writeProgress.setMinimumWidth(760);
+    writeProgress.resize(820, 220);
+    writeProgress.show();
+    QApplication::processEvents();
     statusLabel->setText("Installing artwork directly into OPL PFS storage...");
     QString output;
     const bool ok = runPrivilegedWriter(disk,
             { "--pfsshell", pfsshellPath, "--copy-manifest", manifestPath, "--partition", currentOplPartition }, &output);
+    writeProgress.close();
     QFile::remove(manifestPath);
     resetProgress();
     if (!ok) {
@@ -1029,7 +1239,7 @@ void MainWindow::addArtwork()
         return;
     }
 
-    // The managed OPL preset already enables cover art. 0.5 also asks the
+    // The managed OPL preset already enables cover art. The initial alpha also asks the
     // writer to patch only enable_coverart on existing configs, preserving
     // every other user setting.
     QString configOutput;
@@ -1038,12 +1248,16 @@ void MainWindow::addArtwork()
               "--pfs-path", currentOplBase }, &configOutput);
 
     refreshCurrentPs2Tree();
-    QString summary = QString("Artwork installed: %1 file(s)\nDownloaded now: %2\nReused from cache: %3\nUnavailable: %4")
-            .arg(fileCount).arg(downloaded).arg(cached).arg(missing);
+    QString summary = QString("Artwork installed: %1 file(s)\nDownloaded now: %2\nReused from cache: %3")
+            .arg(fileCount).arg(downloaded).arg(cached);
+    if (optionalScreenshotsMissing)
+        summary += QString("\nOptional screenshots not in database: %1").arg(optionalScreenshotsMissing);
+    if (otherUnavailable)
+        summary += QString("\nOther artwork unavailable/download errors: %1").arg(otherUnavailable);
     if (!configOk)
         summary += "\n\nArtwork files are installed, but enable_coverart could not be patched automatically:\n" + configOutput.right(1200);
-    if (!missingExamples.isEmpty())
-        summary += "\n\nExamples not found:\n" + missingExamples.join('\n');
+    if (!unavailableExamples.isEmpty())
+        summary += "\n\nExamples requiring attention:\n" + unavailableExamples.join('\n');
     statusLabel->setText(QString("Installed %1 OPL artwork file(s) directly from the local cache/database provider.").arg(fileCount));
     QMessageBox::information(this, "OPL artwork installed", summary);
 #else
@@ -1053,88 +1267,520 @@ void MainWindow::addArtwork()
 
 void MainWindow::resetProgress()
 {
-    if (!transferProgress || !progressDetail) return;
-    transferProgress->setRange(0, 100); transferProgress->setValue(0); transferProgress->setVisible(false);
-    progressDetail->clear(); progressDetail->setVisible(false);
+    if (transferProgress) {
+        transferProgress->setRange(0, 100);
+        transferProgress->setValue(0);
+        transferProgress->setFormat("%p%");
+        transferProgress->setVisible(false);
+    }
+    if (progressDetail) {
+        progressDetail->clear();
+        progressDetail->setVisible(false);
+    }
+    if (overallProgress) {
+        overallProgress->setRange(0, 100);
+        overallProgress->setValue(0);
+        overallProgress->setFormat("%p%");
+        overallProgress->setProperty("queueTotalBytes", QVariant());
+        overallProgress->setProperty("queueCompletedBytes", QVariant());
+        overallProgress->setProperty("queueCurrentBytes", QVariant());
+        overallProgress->setProperty("queueGameIndex", QVariant());
+        overallProgress->setProperty("queueGameCount", QVariant());
+        overallProgress->setVisible(false);
+    }
+    if (overallProgressDetail) {
+        overallProgressDetail->clear();
+        overallProgressDetail->setVisible(false);
+    }
 }
 
 void MainWindow::parseTransferProgress(const QString &text, const QString &prefix)
 {
-    static const QRegularExpression re(R"((\d{1,3})%,\s*([^,\r\n]+)\s+remaining,\s*([0-9.]+)\s+MB/sec)");
+    static const QRegularExpression re(
+            R"((\d{1,3})%,\s*([^,\r\n]+)\s+remaining,\s*([0-9.]+)\s+MB/sec)");
     auto matches = re.globalMatch(text);
     QRegularExpressionMatch last;
-    while (matches.hasNext()) last = matches.next();
-    if (!last.hasMatch()) return;
-    const int pc = std::clamp(last.captured(1).toInt(), 0, 100);
-    transferProgress->setRange(0, 100); transferProgress->setValue(pc); transferProgress->setVisible(true);
-    progressDetail->setText(QString("%1%2% — %3 remaining — %4 MB/s")
-            .arg(prefix.isEmpty() ? QString() : prefix + " — ").arg(pc).arg(last.captured(2).trimmed()).arg(last.captured(3)));
-    progressDetail->setVisible(true);
+    while (matches.hasNext())
+        last = matches.next();
+    if (!last.hasMatch())
+        return;
+
+    const int currentPc = std::clamp(last.captured(1).toInt(), 0, 100);
+
+    if (transferProgress) {
+        transferProgress->setRange(0, 100);
+        transferProgress->setValue(currentPc);
+        transferProgress->setFormat(QString("Current game %1%").arg(currentPc));
+        transferProgress->setVisible(true);
+    }
+    if (progressDetail) {
+        progressDetail->setText(
+                QString("%1 — %2% — %3 remaining — %4 MB/s")
+                        .arg(prefix.isEmpty() ? QString("Current game") : prefix)
+                        .arg(currentPc)
+                        .arg(last.captured(2).trimmed())
+                        .arg(last.captured(3)));
+        progressDetail->setVisible(true);
+    }
+
+    if (overallProgress && overallProgressDetail) {
+        const qulonglong totalBytes =
+                overallProgress->property("queueTotalBytes").toULongLong();
+        const qulonglong completedBytes =
+                overallProgress->property("queueCompletedBytes").toULongLong();
+        const qulonglong currentBytes =
+                overallProgress->property("queueCurrentBytes").toULongLong();
+        const int gameIndex =
+                overallProgress->property("queueGameIndex").toInt();
+        const int gameCount =
+                overallProgress->property("queueGameCount").toInt();
+
+        int overallPc = 0;
+        if (totalBytes > 0) {
+            const qulonglong weighted =
+                    completedBytes * 100ULL +
+                    currentBytes * static_cast<qulonglong>(currentPc);
+            overallPc = static_cast<int>(
+                    std::min<qulonglong>(100ULL, weighted / totalBytes));
+        }
+
+        overallProgress->setRange(0, 100);
+        overallProgress->setValue(overallPc);
+        overallProgress->setFormat(QString("Overall %1%").arg(overallPc));
+        overallProgress->setVisible(true);
+
+        overallProgressDetail->setText(
+                QString("OVERALL — %1% — game %2 of %3")
+                        .arg(overallPc)
+                        .arg(gameIndex)
+                        .arg(gameCount));
+        overallProgressDetail->setVisible(true);
+    }
 }
 
 void MainWindow::installGameFiles(const QStringList &inputPaths)
 {
 #ifdef __linux__
-    if (!unlockHddSession(true)) return;
+    if (!unlockHddSession(true))
+        return;
+
     QString reason;
-    if (!selectedDiskCanInstallGames(&reason)) { QMessageBox::warning(this, "HDL game install unavailable", reason); return; }
-    QSet<QString> seen; QStringList paths;
-    for (const QString &p : inputPaths) {
-        const QFileInfo info(p);
-        if (!info.isFile() || !isDiscImagePath(p)) continue;
-        QString key = info.canonicalFilePath(); if (key.isEmpty()) key = info.absoluteFilePath();
-        if (!seen.contains(key)) { seen.insert(key); paths << info.absoluteFilePath(); }
-    }
-    if (paths.isEmpty()) {
-        QMessageBox::information(this, "No PS2 images", "Drop/select one or more supported PS2 disc images (ISO/BIN/GI/IML/NRG/ZSO)."); return;
+    if (!selectedDiskCanInstallGames(&reason)) {
+        QMessageBox::warning(this, "HDL game install unavailable", reason);
+        return;
     }
 
-    struct Game { QString path, name, media; };
-    std::vector<Game> games; QStringList preview;
-    setCursor(Qt::WaitCursor);
-    for (const QString &path : paths) {
+    if (!gameBankCombo || gameBankCombo->currentIndex() < 0 ||
+            gameBankCombo->currentData().toInt() < 0) {
+        QMessageBox::warning(
+                this, "Choose a destination bank",
+                "Choose an explicit bank before starting the queue.");
+        return;
+    }
+
+    struct Game {
+        QString path;
+        QString key;
+        QString name;
+        QString media;
+        int bank = 0;
+        qulonglong bytes = 0;
+    };
+
+    const int fallbackBank = gameBankCombo->currentData().toInt();
+
+    auto bankLabel = [&](int bank) -> QString {
+        const int comboIndex = gameBankCombo ? gameBankCombo->findData(bank) : -1;
+        if (comboIndex >= 0)
+            return gameBankCombo->itemText(comboIndex);
+        return QString("Bank %1").arg(bank);
+    };
+
+    auto makeGame = [&](const QString &path, int bank, Game *out, QString *error) -> bool {
+        const QFileInfo info(path);
+        if (!info.isFile() || !isDiscImagePath(path)) {
+            if (error) *error = "Not a supported disc-image path.";
+            return false;
+        }
+
         QString media, probe;
         if (!probeGameImage(path, &media, &probe)) {
-            unsetCursor(); QMessageBox::critical(this, "Not a supported PS2 disc image", path + "\n\n" + probe.right(5000)); return;
+            if (error) *error = probe.right(1200);
+            return false;
         }
-        QString name = QFileInfo(path).completeBaseName().trimmed();
-        if (name.isEmpty()) name = "PS2 Game"; if (name.size() > 159) name.truncate(159);
-        games.push_back({ path, name, media }); preview << QString("%1 [%2]").arg(name, media.toUpper());
+
+        QString name = info.completeBaseName().trimmed();
+        if (name.isEmpty())
+            name = "PS2 Game";
+        if (name.size() > 159)
+            name.truncate(159);
+
+        out->path = info.absoluteFilePath();
+        out->key = normalizedLocalPath(out->path);
+        out->name = name;
+        out->media = media;
+        out->bank = bank;
+        out->bytes = static_cast<qulonglong>(info.size());
+        return !out->key.isEmpty();
+    };
+
+    std::vector<Game> games;
+    QSet<QString> knownQueued;
+    QStringList failedResults;
+    QStringList retriedResults;
+    QStringList verificationWarnings;
+
+    setCursor(Qt::WaitCursor);
+    for (const QString &path : inputPaths) {
+        const QString key = normalizedLocalPath(path);
+        if (key.isEmpty() || knownQueued.contains(key))
+            continue;
+
+        const int bank = queuedPcBanks.value(key, fallbackBank);
+
+        Game game;
+        QString error;
+        if (!makeGame(path, bank, &game, &error))
+            continue;
+
+        knownQueued.insert(game.key);
+        games.push_back(game);
     }
     unsetCursor();
 
-    const auto &disk = disks[static_cast<std::size_t>(diskCombo->currentIndex())];
-    if (QMessageBox::question(this, "Install games to PS2 HDD",
-            QString("Install %1 game(s) as normal HDL APA partitions?\n\n%2\n\n%3")
-                .arg(static_cast<qulonglong>(games.size()))
-                .arg(QString::fromStdString(disk.devicePath))
-                .arg(preview.join('\n')),
-            QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes) return;
+    if (games.empty()) {
+        QMessageBox::information(
+                this, "No PS2 images",
+                "Select or queue one or more supported PS2 disc images.");
+        return;
+    }
+
+    QMap<int, int> initialBankCounts;
+    for (const Game &game : games)
+        initialBankCounts[game.bank] += 1;
+
+    QStringList initialDestinations;
+    for (auto it = initialBankCounts.cbegin(); it != initialBankCounts.cend(); ++it)
+        initialDestinations << QString("%1 — %2 game(s)")
+                .arg(bankLabel(it.key()))
+                .arg(it.value());
+
+    const auto &disk =
+            disks[static_cast<std::size_t>(diskCombo->currentIndex())];
+
+    if (QMessageBox::question(
+                this,
+                "Install queued games to PS2 HDD",
+                QString("Install %1 queued game(s) as HDL APA partitions?\n\n"
+                        "%2\n\nDestinations:\n%3\n\n"
+                        "You can change the bank selector and add more games "
+                        "while this queue is running.")
+                        .arg(static_cast<qulonglong>(games.size()))
+                        .arg(QString::fromStdString(disk.devicePath))
+                        .arg(initialDestinations.join('\n')),
+                QMessageBox::Yes | QMessageBox::Cancel,
+                QMessageBox::Cancel) != QMessageBox::Yes)
+        return;
+
+    qulonglong totalBytes = 0;
+    for (const Game &game : games)
+        totalBytes += game.bytes;
+
+    qulonglong completedBytes = 0;
 
     copyToPs2Button->setEnabled(false);
-    transferProgress->setVisible(true); progressDetail->setVisible(true);
-    for (std::size_t i = 0; i < games.size(); i++) {
-        const Game &game = games[i];
-        transferProgress->setRange(0,100); transferProgress->setValue(0);
-        const QString prefix = QString("Game %1 of %2: %3").arg(i + 1).arg(static_cast<qulonglong>(games.size())).arg(game.name);
-        progressDetail->setText(prefix); statusLabel->setText("Installing " + game.name + "...");
-        QString output;
-        const QStringList args = { "--hdl-dump", hdlDumpPath, "--install-game", game.path,
-                "--game-name", game.name, "--media", game.media };
-        if (!runPrivilegedWriter(disk, args, &output, true, prefix)) {
-            copyToPs2Button->setEnabled(selectedDiskCanInstallGames()); resetProgress();
-            QMessageBox::critical(this, "HDL game installation failed", game.name + "\n\n" + output.right(9000));
-            refreshCurrentPs2Tree(); return;
+
+    overallProgress->setRange(0, 100);
+    overallProgress->setValue(0);
+    overallProgress->setFormat("Overall 0%");
+    overallProgress->setProperty("queueTotalBytes", totalBytes);
+    overallProgress->setProperty("queueCompletedBytes", 0);
+    overallProgress->setProperty("queueCurrentBytes", 0);
+    overallProgress->setProperty("queueGameIndex", 0);
+    overallProgress->setProperty("queueGameCount", static_cast<int>(games.size()));
+    overallProgress->setVisible(true);
+
+    overallProgressDetail->setText(
+            QString("OVERALL — 0% — 0 of %1 games")
+                    .arg(static_cast<qulonglong>(games.size())));
+    overallProgressDetail->setVisible(true);
+
+    transferProgress->setRange(0, 100);
+    transferProgress->setValue(0);
+    transferProgress->setFormat("Current game 0%");
+    transferProgress->setVisible(true);
+    progressDetail->setVisible(true);
+
+    QStringList installedResults;
+
+    auto scanBank = [&](int bank, QString *scanOutput) -> bool {
+        QString local;
+        const QStringList scanArgs = {
+            "--hdl-dump", hdlDumpPath,
+            "--list-games",
+            "--bank", QString::number(bank)
+        };
+        const bool ok = runPrivilegedWriter(disk, scanArgs, &local);
+        if (scanOutput)
+            *scanOutput = local;
+        return ok;
+    };
+
+    auto scanContainsGame = [&](const QString &wanted, int bank, QString *scanOutput) -> bool {
+        QString local;
+        if (!scanBank(bank, &local)) {
+            if (scanOutput)
+                *scanOutput = local;
+            return false;
         }
+
+        if (scanOutput)
+            *scanOutput = local;
+
+        for (const QString &line : local.split('\n', Qt::SkipEmptyParts)) {
+            if (!line.startsWith("GAME\t"))
+                continue;
+
+            const QStringList fields = line.split('\t');
+            if (!fields.isEmpty() &&
+                    cleanMachineField(fields.last()).compare(
+                            wanted, Qt::CaseInsensitive) == 0)
+                return true;
+        }
+        return false;
+    };
+
+    auto appendLiveQueue = [&]() {
+        QApplication::processEvents();
+
+        QStringList marked = markedPcPaths.values();
+        marked.sort(Qt::CaseInsensitive);
+
+        int added = 0;
+        for (const QString &path : marked) {
+            const QString key = normalizedLocalPath(path);
+            if (key.isEmpty() || knownQueued.contains(key))
+                continue;
+
+            const int bank = queuedPcBanks.value(key, fallbackBank);
+
+            Game game;
+            QString error;
+            if (!makeGame(path, bank, &game, &error)) {
+                knownQueued.insert(key);
+                failedResults << QFileInfo(path).fileName()
+                        + " — could not be added to live queue: " + error;
+                continue;
+            }
+
+            knownQueued.insert(game.key);
+            games.push_back(game);
+            totalBytes += game.bytes;
+            ++added;
+        }
+
+        if (added > 0) {
+            overallProgress->setProperty("queueTotalBytes", totalBytes);
+            overallProgress->setProperty(
+                    "queueGameCount", static_cast<int>(games.size()));
+            statusBar()->showMessage(
+                    QString("%1 new game(s) appended; %2 total in this run.")
+                            .arg(added)
+                            .arg(static_cast<qulonglong>(games.size())));
+        }
+    };
+
+    auto finishQueueItem = [&](const Game &game, std::size_t index) {
+        completedBytes += game.bytes;
+
+        overallProgress->setProperty("queueCompletedBytes", completedBytes);
+        overallProgress->setProperty("queueCurrentBytes", 0);
+        overallProgress->setProperty("queueGameIndex", static_cast<int>(index + 1));
+        overallProgress->setProperty("queueGameCount", static_cast<int>(games.size()));
+
+        const int overallPc = totalBytes
+                ? static_cast<int>(
+                        std::min<qulonglong>(
+                                100ULL,
+                                (completedBytes * 100ULL) / totalBytes))
+                : 100;
+
+        overallProgress->setValue(overallPc);
+        overallProgress->setFormat(QString("Overall %1%").arg(overallPc));
+        overallProgressDetail->setText(
+                QString("OVERALL — %1% — %2 of %3 games processed")
+                        .arg(overallPc)
+                        .arg(index + 1)
+                        .arg(static_cast<qulonglong>(games.size())));
+        QApplication::processEvents();
+    };
+
+    for (std::size_t i = 0; i < games.size(); ++i) {
+        appendLiveQueue();
+
+        Game &game = games[i];
+
+        if (markedPcPaths.contains(game.key) &&
+                queuedPcBanks.contains(game.key))
+            game.bank = queuedPcBanks.value(game.key, game.bank);
+
+        const QString destination = bankLabel(game.bank);
+
+        overallProgress->setProperty("queueTotalBytes", totalBytes);
+        overallProgress->setProperty("queueCompletedBytes", completedBytes);
+        overallProgress->setProperty("queueCurrentBytes", game.bytes);
+        overallProgress->setProperty("queueGameIndex", static_cast<int>(i + 1));
+        overallProgress->setProperty("queueGameCount", static_cast<int>(games.size()));
+
+        transferProgress->setRange(0, 100);
+        transferProgress->setValue(0);
+        transferProgress->setFormat("Current game 0%");
+
+        const QString prefix =
+                QString("Game %1 of %2: %3 — %4")
+                        .arg(i + 1)
+                        .arg(static_cast<qulonglong>(games.size()))
+                        .arg(game.name)
+                        .arg(destination);
+
+        progressDetail->setText(prefix);
+        progressDetail->setVisible(true);
+
+        statusLabel->setText(
+                QString("Re-scanning Bank %1 before %2...")
+                        .arg(game.bank)
+                        .arg(game.name));
+        QApplication::processEvents();
+
+        QString preScan;
+        if (!scanBank(game.bank, &preScan)) {
+            failedResults << game.name
+                    + QString(" — Bank %1 pre-scan failed: ").arg(game.bank)
+                    + preScan.right(700).trimmed();
+
+            appendLiveQueue();
+            finishQueueItem(game, i);
+            continue;
+        }
+
+        const QStringList installArgs = {
+            "--hdl-dump", hdlDumpPath,
+            "--install-game", game.path,
+            "--game-name", game.name,
+            "--media", game.media,
+            "--bank", QString::number(game.bank)
+        };
+
+        QString output;
+        bool installed = runPrivilegedWriter(
+                disk, installArgs, &output, true, prefix);
+        bool usedRetry = false;
+
+        if (!installed) {
+            QString freshScan;
+            if (scanContainsGame(game.name, game.bank, &freshScan)) {
+                installed = true;
+                verificationWarnings << game.name
+                        + QString(" — writer reported an error, but a fresh "
+                                  "Bank %1 scan confirms the title is present.")
+                                  .arg(game.bank);
+            } else {
+                statusLabel->setText(
+                        "Install attempt failed for " + game.name
+                        + ". Fresh destination-bank scan proves it is absent; retrying once...");
+                QApplication::processEvents();
+
+                usedRetry = true;
+                output.clear();
+                installed = runPrivilegedWriter(
+                        disk, installArgs, &output, true, prefix + " — retry");
+            }
+        }
+
+        if (installed) {
+            QString verifyScan;
+            if (scanContainsGame(game.name, game.bank, &verifyScan)) {
+                installedResults << QString("%1 — Bank %2")
+                        .arg(game.name)
+                        .arg(game.bank);
+
+                if (usedRetry)
+                    retriedResults << QString("%1 — Bank %2")
+                            .arg(game.name)
+                            .arg(game.bank);
+
+                markedPcPaths.remove(game.key);
+                queuedPcBanks.remove(game.key);
+            } else {
+                failedResults << game.name
+                        + QString(" — writer completed, but a fresh Bank %1 "
+                                  "scan did not find the title.")
+                                  .arg(game.bank);
+            }
+        } else {
+            failedResults << QString("%1 — Bank %2 — %3")
+                    .arg(game.name)
+                    .arg(game.bank)
+                    .arg(output.right(900).trimmed());
+        }
+
         transferProgress->setValue(100);
+        transferProgress->setFormat("Current game 100%");
+
+        appendLiveQueue();
+        finishQueueItem(game, i);
+
+        if (pcView) {
+            pcView->viewport()->update();
+            pcView->update();
+        }
+
+        updateMarkedStatus();
+        QApplication::processEvents();
     }
+
     copyToPs2Button->setEnabled(selectedDiskCanInstallGames());
-    progressDetail->setText(QString("Complete — %1 game(s) installed and verified").arg(static_cast<qulonglong>(games.size())));
-    transferProgress->setValue(100);
-    statusLabel->setText("HDL install complete. Refreshing the real game table...");
+
+    overallProgress->setValue(100);
+    overallProgress->setFormat("Overall 100%");
+    overallProgressDetail->setText(
+            QString("OVERALL — complete — %1 game(s) processed")
+                    .arg(static_cast<qulonglong>(games.size())));
+
+    statusLabel->setText(
+            "HDL queue finished. Refreshing the game table once...");
+    QApplication::processEvents();
     refreshCurrentPs2Tree();
-    QMessageBox::information(this, "HDL game installation complete",
-            QString("%1 game(s) installed and verified. The right pane has been re-read from the HDD.").arg(static_cast<qulonglong>(games.size())));
+
+    QString summary =
+            QString("Installed: %1 / %2")
+                    .arg(installedResults.size())
+                    .arg(static_cast<qulonglong>(games.size()));
+
+    if (!installedResults.isEmpty())
+        summary += "\n\nInstalled destinations:\n  "
+                + installedResults.join("\n  ");
+
+    if (!retriedResults.isEmpty())
+        summary += "\n\nSucceeded on automatic retry:\n  "
+                + retriedResults.join("\n  ");
+
+    if (!failedResults.isEmpty())
+        summary += "\n\nFailed (left queued when applicable):\n  "
+                + failedResults.join("\n  ");
+
+    if (!verificationWarnings.isEmpty())
+        summary += "\n\nVerification notes:\n  "
+                + verificationWarnings.join("\n  ");
+
+    QMessageBox::information(
+            this,
+            failedResults.isEmpty()
+                    ? "HDL game installation complete"
+                    : "HDL game queue completed with errors",
+            summary);
+
+    resetProgress();
 #else
     Q_UNUSED(inputPaths);
 #endif
@@ -1558,42 +2204,72 @@ void MainWindow::applyRecommendedOplDefaults()
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
-    if (pcView && watched == pcView->viewport() && event->type() == QEvent::MouseButtonPress) {
-        auto *mouse = static_cast<QMouseEvent *>(event);
-        if (mouse->button() == Qt::RightButton) {
-            const QModelIndex index = pcView->indexAt(mouse->position().toPoint());
-            if (index.isValid()) {
-                toggleMarkedPcPath(index);
+    if (pcView && watched == pcView->viewport()) {
+        if (event->type() == QEvent::MouseButtonPress) {
+            auto *mouse = static_cast<QMouseEvent *>(event);
+            if (mouse->button() == Qt::RightButton)
+                return true;
+        } else if (event->type() == QEvent::MouseButtonRelease) {
+            auto *mouse = static_cast<QMouseEvent *>(event);
+            if (mouse->button() == Qt::RightButton) {
+                const QModelIndex index = pcView->indexAt(mouse->position().toPoint());
+                if (index.isValid()) {
+                    pcView->setCurrentIndex(index.sibling(index.row(), 0));
+                    toggleMarkedPcPath(index);
+                }
                 return true;
             }
         }
     }
+
     if (ps2View && watched == ps2View->viewport()) {
         if (event->type() == QEvent::DragEnter) {
             auto *drag = static_cast<QDragEnterEvent *>(event);
-            if (!localUrls(drag->mimeData()).isEmpty()) { drag->acceptProposedAction(); return true; }
+            if (!localUrls(drag->mimeData()).isEmpty()) {
+                drag->acceptProposedAction();
+                return true;
+            }
         } else if (event->type() == QEvent::DragMove) {
             auto *drag = static_cast<QDragMoveEvent *>(event);
-            if (!localUrls(drag->mimeData()).isEmpty()) { drag->acceptProposedAction(); return true; }
+            if (!localUrls(drag->mimeData()).isEmpty()) {
+                drag->acceptProposedAction();
+                return true;
+            }
         } else if (event->type() == QEvent::Drop) {
             auto *drop = static_cast<QDropEvent *>(event);
             const QStringList paths = localUrls(drop->mimeData());
-            if (paths.isEmpty()) return false;
+            if (paths.isEmpty())
+                return false;
+
             QTreeWidgetItem *target = ps2View->itemAt(drop->position().toPoint());
             int kind = target ? target->data(0, KindRole).toInt() : NodeNone;
-            if (kind == NodeGame && target->parent()) { target = target->parent(); kind = target->data(0, KindRole).toInt(); }
+            if (kind == NodeGame && target->parent()) {
+                target = target->parent();
+                kind = target->data(0, KindRole).toInt();
+            }
+
             const bool gameTarget = kind == NodeGamesRoot || kind == NodeGamesMedia;
             if (gameTarget) {
-                drop->acceptProposedAction(); installGameFiles(paths); return true;
+                drop->acceptProposedAction();
+                installGameFiles(paths);
+                return true;
             }
+
             if (kind == NodePfsDirectory || kind == NodePfsFile) {
-                drop->acceptProposedAction(); copyPcItemsToPfs(paths, target); return true;
+                drop->acceptProposedAction();
+                copyPcItemsToPfs(paths, target);
+                return true;
             }
-            // Dropping disc images anywhere else on the PS2 pane still means install games.
-            if (std::all_of(paths.begin(), paths.end(), [](const QString &p) { return QFileInfo(p).isFile() && isDiscImagePath(p); })) {
-                drop->acceptProposedAction(); installGameFiles(paths); return true;
+
+            if (std::all_of(paths.begin(), paths.end(), [](const QString &p) {
+                    return QFileInfo(p).isFile() && isDiscImagePath(p);
+                })) {
+                drop->acceptProposedAction();
+                installGameFiles(paths);
+                return true;
             }
         }
     }
+
     return QMainWindow::eventFilter(watched, event);
 }

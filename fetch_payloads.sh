@@ -5,7 +5,7 @@ project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 payload_root="$project_root/payload/runtime"
 cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/ps2-hdd-manager"
 download_cache="$cache_root/downloads"
-want_opl=0 want_wle=0 want_fhdb=0 want_enabler=0 want_mca=0 want_freedvdboot=0
+want_opl=0 want_opl_extended=0 want_wle=0 want_fhdb=0 want_enabler=0 want_mca=0 want_freedvdboot=0
 
 usage() {
     cat <<'USAGE'
@@ -14,7 +14,8 @@ Usage: ./fetch_payloads.sh [--opl] [--wle] [--mca] [--fhdb] [--hdd-enabler] [--f
 Downloads only selected optional payloads. Downloads/toolchains are persisted under
 ~/.cache/ps2-hdd-manager so subsequent PS2 HDD Manager builds reuse them.
 
-  --opl            Latest Open PS2 Loader development ELF (tag: latest)
+  --opl            Latest official Open PS2 Loader development ELF (tag: latest)
+  --opl-extended-apa  Hardware-tested Extended APA ELF for >2 TiB banked HDDs
   --wle            Latest normal wLaunchELF_ISR BOOT.ELF (tag: latest)
   --mca            Latest Memory Card Annihilator packed ELF
   --fhdb           Pinned FreeHDBoot 1.966 HDD payload
@@ -28,6 +29,7 @@ USAGE
 for arg in "$@"; do
     case "$arg" in
         --opl) want_opl=1 ;;
+        --opl-extended-apa) want_opl_extended=1 ;;
         --wle) want_wle=1 ;;
         --mca) want_mca=1 ;;
         --fhdb) want_fhdb=1 ;;
@@ -126,6 +128,30 @@ if (( want_opl )); then
     require_elf "$payload_root/opl/OPNPS2LD.ELF"
 fi
 
+if (( want_opl_extended )); then
+    echo "==> Open PS2 Loader Extended APA - pinned hardware-tested release"
+    mkdir -p "$payload_root/opl"
+    extended_repo="L10N37/Open-PS2-Loader-Extended-APA"
+    extended_tag="v1.2.0-Beta-2273-Extended-APA-1"
+    extended_asset="OPNPS2LD-Extended-APA-v1.2.0-Beta-2273.ELF"
+    extended_sha="aa7d6765f88fec8d059ebb4fafc76e75e5cd8f8820e083fec0f45640ed32a244"
+
+    echo "    public release: https://github.com/${extended_repo}/releases/tag/${extended_tag}"
+    cached_release_asset "$extended_repo" "$extended_tag" "$extended_asset" exact \
+        "$payload_root/opl/OPNPS2LD.ELF"
+    require_elf "$payload_root/opl/OPNPS2LD.ELF"
+
+    actual_sha="$(sha256sum "$payload_root/opl/OPNPS2LD.ELF" | awk '{print $1}')"
+    if [[ "$actual_sha" != "$extended_sha" ]]; then
+        echo "Extended APA OPL checksum mismatch." >&2
+        echo "Expected: $extended_sha" >&2
+        echo "Actual:   $actual_sha" >&2
+        rm -f "$payload_root/opl/OPNPS2LD.ELF"
+        exit 1
+    fi
+    echo "    verified hardware-tested ELF: sha256:$actual_sha"
+fi
+
 if (( want_wle )); then
     echo "==> wLaunchELF ISR"
     mkdir -p "$payload_root/wle"
@@ -192,7 +218,7 @@ ensure_ps2dev() {
     local marker="$tcroot/.ready"
     local compiler=""
 
-    # Reuse an already extracted archive even when 0.4.0 created a .ready
+    # Reuse an already extracted archive even when an older preparer created a .ready
     # marker before validating the old ee-gcc alias.
     if [[ -d "$tcroot/unpacked" ]]; then
         compiler="$(find "$tcroot/unpacked" -type f -path '*/ee/bin/mips64r5900el-ps2-elf-gcc' -print -quit 2>/dev/null || true)"

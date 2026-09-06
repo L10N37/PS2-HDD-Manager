@@ -1,4 +1,5 @@
 #include "core/Ps2Apa.h"
+#include "core/Ps2ApaBank.h"
 #include "core/FhdbConfig.h"
 #include "core/PhysicalDisk.h"
 #include "core/Ps2HddLayout.h"
@@ -404,6 +405,38 @@ void testProvisionPfsshellScripts()
             "device /dev/sdz\nexit\n");
 }
 
+
+void testGamesOnlyBankInitializer()
+{
+    char imagePath[] = "/tmp/ps2-hdd-upper-bank-XXXXXX";
+    const int descriptor = mkstemp(imagePath);
+    TEST_CHECK(descriptor >= 0);
+    TemporaryProbeFile image(descriptor, imagePath);
+
+    const std::uint64_t bank1BaseBytes = Ps2::HddLayoutPlanner::BankBoundarySectors *
+            Ps2::HddLayoutPlanner::SectorSize;
+    const std::uint64_t imageSize = bank1BaseBytes +
+            Ps2::HddLayoutPlanner::MinimumBankSizeSectors * Ps2::HddLayoutPlanner::SectorSize;
+    TEST_CHECK(ftruncate(descriptor, static_cast<off_t>(imageSize)) == 0);
+    TEST_CHECK(image.closeFile() == 0);
+
+    Ps2::ApaBank::InitializeGamesOnly(imagePath, imageSize, 1, false);
+    const auto probes = Ps2::Apa::ProbePhysicalDrive(imagePath, imageSize, 2);
+    TEST_CHECK(probes.size() == 2);
+    TEST_CHECK(probes[0].header.state == Ps2::ApaHeaderState::NotPresent);
+    TEST_CHECK(probes[1].header.state == Ps2::ApaHeaderState::Valid);
+    TEST_CHECK(probes[1].header.id == "__mbr");
+    TEST_CHECK(probes[1].header.start == 0);
+    TEST_CHECK(probes[1].header.length == 0x40000U);
+    TEST_CHECK(probes[1].header.next == 0);
+    TEST_CHECK(probes[1].header.previous == 0);
+
+    bool refusedOverwrite = false;
+    try { Ps2::ApaBank::InitializeGamesOnly(imagePath, imageSize, 1, false); }
+    catch (const std::runtime_error &) { refusedOverwrite = true; }
+    TEST_CHECK(refusedOverwrite);
+}
+
 void testApaPartitionChainReader()
 {
     char imagePath[] = "/tmp/ps2-hdd-apa-chain-XXXXXX";
@@ -463,6 +496,7 @@ int main()
     testStandardPfsshellScripts();
     testProvisionPfsshellScripts();
     testApaPartitionChainReader();
+    testGamesOnlyBankInitializer();
 #endif
     std::cout << "PS2 APA, layout, standard-format and FHDB configuration tests passed.\n";
     return 0;

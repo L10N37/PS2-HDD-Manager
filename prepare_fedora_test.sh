@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# PS2 HDD Manager 0.5.0-alpha Fedora preparer.
+# PS2 HDD Manager 0.1.0-alpha Fedora preparer.
 # Host backends are cached persistently; this script never opens a physical HDD.
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,7 +65,7 @@ mkdir -p "$backend_cache"
 
 # ----- pfsshell ---------------------------------------------------------------
 pfsshell_commit="8c92467b3d715c3698f1f8ce63a8a07e214d6c73"
-pfsshell_patch_rev="fast-format-v2+pfs-merge-v1"
+pfsshell_patch_rev="fast-format-v2+pfs-merge-v1+banked-atad-v1"
 pfsshell_key="${pfsshell_commit}-${pfsshell_patch_rev}"
 pfsshell_cache="$backend_cache/pfsshell/$pfsshell_key"
 pfsshell_cached_bin="$pfsshell_cache/bin/pfsshell"
@@ -112,6 +112,57 @@ s=s.replace(old2,new2,1)
 p.write_text(s)
 PYPFS
 
+    atad_c="$src/subprojects/fakeps2sdk/atad.c"
+    python3 - "$atad_c" <<'PYPFSBANK'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); s=p.read_text()
+s=s.replace('#include <fcntl.h>\n', '#include <fcntl.h>\n#include <ctype.h>\n', 1)
+s=s.replace('static u32 hdd_length = 0; /* in sectors */', 'static u32 hdd_length = 0; /* selected virtual bank, sectors */\nstatic u64 hdd_base_sector = 0; /* physical sector base */', 1)
+old = """void set_atad_device_path(const char *path)
+{
+    int fd;
+    fd = open(path, O_RDWR | O_BINARY);
+    if (fd == -1 || set_atad_device_handle(fd)) {
+        perror(path), exit(1);
+    }
+}"""
+new = """void set_atad_device_path(const char *path)
+{
+    const u64 BANK_SECTORS = ((u64)1 << 32);
+    const u64 MAX_VIRTUAL_SECTORS = 0xfffffffeULL;
+    const char *real_path = path;
+    u64 bank_index = 0;
+    int fd;
+    if (strncmp(path, \"bank\", 4) == 0) {
+        const char *cursor = path + 4;
+        if (!isdigit((unsigned char)*cursor)) { fprintf(stderr, \"Invalid banked path: %s\\n\", path); exit(1); }
+        while (isdigit((unsigned char)*cursor)) { bank_index = bank_index * 10 + (u64)(*cursor - '0'); if (bank_index > 255) exit(1); ++cursor; }
+        if (*cursor != ':' || cursor[1] == '\\0') { fprintf(stderr, \"Invalid banked path: %s\\n\", path); exit(1); }
+        real_path = cursor + 1;
+    }
+    fd = open(real_path, O_RDWR | O_BINARY);
+    if (fd == -1 || set_atad_device_handle(fd)) { perror(real_path), exit(1); }
+    hdd_base_sector = 0;
+    if (real_path != path) {
+        off_t size = lseek(fd, 0, SEEK_END);
+        if (size == (off_t)-1) { perror(\"lseek\"); exit(1); }
+        const u64 total = (u64)size / 512;
+        const u64 base = bank_index * BANK_SECTORS;
+        if (base >= total) { fprintf(stderr, \"Bank lies beyond disk\\n\"); exit(1); }
+        u64 count = total - base; if (count > MAX_VIRTUAL_SECTORS) count = MAX_VIRTUAL_SECTORS;
+        hdd_base_sector = base; hdd_length = (u32)count;
+    }
+}"""
+if old not in s: raise SystemExit('Could not patch set_atad_device_path')
+s=s.replace(old,new,1)
+old2='    off_t pos = lseek(handle, (off_t)lba * 512, SEEK_SET);'
+new2='    if ((u64)lba + nsectors > (u64)hdd_length) return (-1);\n    off_t pos = lseek(handle, (off_t)(hdd_base_sector + (u64)lba) * 512, SEEK_SET);'
+if old2 not in s: raise SystemExit('Could not patch atad seek')
+s=s.replace(old2,new2,1)
+p.write_text(s)
+PYPFSBANK
+
     build="$pfsshell_cache/build"
     meson setup "$build" "$src" --buildtype=release -Denable_pfsfuse=false \
         -Denable_pfs2tar=false -Denable_pfsd=false -Denable_ps2kinst=false
@@ -127,25 +178,118 @@ printf '%s\n' "ps2homebrew/pfsshell @ $pfsshell_commit" "patch=$pfsshell_patch_r
 
 # ----- hdl-dump ---------------------------------------------------------------
 hdl_commit="32c296c69cf9c263fcbe035004aa28c345b3b279"
-hdl_cache="$backend_cache/hdl-dump/$hdl_commit"
+hdl_patch_rev="banked-hio-v1"
+hdl_key="${hdl_commit}-${hdl_patch_rev}"
+hdl_cache="$backend_cache/hdl-dump/$hdl_key"
 hdl_cached_bin="$hdl_cache/bin/hdl_dump"
 if [[ -x "$hdl_cached_bin" ]]; then
-    echo "==> hdl-dump: cache hit"
+    echo "==> hdl-dump: cache hit ($hdl_patch_rev)"
 else
-    echo "==> hdl-dump: one-time build for pinned revision"
+    echo "==> hdl-dump: one-time build for pinned bank-aware revision"
     rm -rf "$hdl_cache"; mkdir -p "$hdl_cache"
     git clone https://github.com/ps2homebrew/hdl-dump.git "$hdl_cache/source"
     git -C "$hdl_cache/source" checkout --detach "$hdl_commit"
+    python3 - "$hdl_cache/source/hio_win32.c" <<'PYHDLBANK'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); s=p.read_text()
+s=s.replace("""typedef struct hio_win32_type
+{
+    hio_t hio;
+    osal_handle_t device;
+    unsigned long error_code; /* against osal_... */
+} hio_win32_t;""","""typedef struct hio_win32_type
+{
+    hio_t hio;
+    osal_handle_t device;
+    unsigned long error_code; /* against osal_... */
+    u_int64_t bank_base_sector;
+    u_int64_t bank_sector_count;
+} hio_win32_t;""",1)
+s=s.replace("""    u_int64_t size_in_bytes;
+    int result = osal_get_estimated_device_size(hw32->device, &size_in_bytes);
+    if (result == OSAL_OK) {
+        if (size_in_bytes / 1024 < (u_int32_t)0xffffffff)
+            *size_in_kb = (u_int32_t)(size_in_bytes / 1024);
+        else
+            *size_in_kb = (u_int32_t)0xffffffff;""","""    u_int64_t size_in_bytes;
+    int result = osal_get_estimated_device_size(hw32->device, &size_in_bytes);
+    if (result == OSAL_OK) {
+        const u_int64_t bank_size_in_kb = hw32->bank_sector_count / 2;
+        (void)size_in_bytes;
+        *size_in_kb = bank_size_in_kb < (u_int32_t)0xffffffff ? (u_int32_t)bank_size_in_kb : (u_int32_t)0xffffffff;""",1)
+oldio="""    hio_win32_t *hw32 = (hio_win32_t *)hio;
+    int result = osal_seek(hw32->device, (u_int64_t)start_sector * 512);"""
+newio="""    hio_win32_t *hw32 = (hio_win32_t *)hio;
+    if ((u_int64_t)start_sector + num_sectors > hw32->bank_sector_count) return RET_ERR;
+    int result = osal_seek(hw32->device, (hw32->bank_base_sector + start_sector) * 512);"""
+if s.count(oldio) < 2: raise SystemExit('Could not patch hdl I/O')
+s=s.replace(oldio,newio,2)
+s=s.replace('win32_alloc(osal_handle_t device) /*@allocates result@*/ /*@defines result@*/','win32_alloc(osal_handle_t device, u_int64_t bank_base_sector, u_int64_t bank_sector_count) /*@allocates result@*/ /*@defines result@*/',1)
+s=s.replace("""        hw32->device = device;
+    }""","""        hw32->device = device;
+        hw32->bank_base_sector = bank_base_sector;
+        hw32->bank_sector_count = bank_sector_count;
+    }""",1)
+needle="""int hio_win32_probe(const dict_t *config,
+                    const char *path,
+                    hio_t **hio)
+{
+    int result;"""
+repl="""int hio_win32_probe(const dict_t *config,
+                    const char *path,
+                    hio_t **hio)
+{
+    const u_int64_t BANK_SECTORS = ((u_int64_t)1 << 32);
+    const u_int64_t MAX_BANK_SECTORS = 0xfffffffeULL;
+    const char *real_path = path;
+    u_int64_t bank_index = 0;
+    int result;
+    if (strncmp(path, \"bank\", 4) == 0) {
+        const char *cursor = path + 4;
+        if (!isdigit((unsigned char)*cursor)) return RET_NOT_COMPAT;
+        while (isdigit((unsigned char)*cursor)) { bank_index=bank_index*10+(u_int64_t)(*cursor-'0'); if(bank_index>255) return RET_BAD_DEVICE; ++cursor; }
+        if (*cursor != ':' || cursor[1] == '\\0') return RET_BAD_DEVICE;
+        real_path = cursor + 1;
+    }"""
+if needle not in s: raise SystemExit('hdl probe missing')
+s=s.replace(needle,repl,1)
+s=s.replace('result = osal_map_device_name(path, device_name);','result = osal_map_device_name(real_path, device_name);',1)
+oldalloc="""            result = osal_open_device_for_writing(device_name, &device);
+            if (result == OSAL_OK) {
+                *hio = win32_alloc(device);
+                if (*hio != NULL)
+                    ; /* success */
+                else
+                    result = RET_NO_MEM;"""
+newalloc="""            result = osal_open_device_for_writing(device_name, &device);
+            if (result == OSAL_OK) {
+                u_int64_t size_in_bytes = 0;
+                result = osal_get_estimated_device_size(device, &size_in_bytes);
+                if (result == OSAL_OK) {
+                    const u_int64_t total = size_in_bytes / 512;
+                    const u_int64_t base = bank_index * BANK_SECTORS;
+                    if (base >= total) result = RET_BAD_DEVICE;
+                    else {
+                        u_int64_t count = total - base; if (count > MAX_BANK_SECTORS) count = MAX_BANK_SECTORS;
+                        *hio = win32_alloc(device, base, count);
+                        if (*hio == NULL) result = RET_NO_MEM;
+                    }
+                }"""
+if oldalloc not in s: raise SystemExit('hdl allocation missing')
+s=s.replace(oldalloc,newalloc,1)
+p.write_text(s)
+PYHDLBANK
     make -C "$hdl_cache/source" RELEASE=yes
     mkdir -p "$hdl_cache/bin"
     install -m 0755 "$hdl_cache/source/hdl_dump" "$hdl_cached_bin"
 fi
 mkdir -p "$project_root/tools/hdl-dump/bin"
 install -m 0755 "$hdl_cached_bin" "$project_root/tools/hdl-dump/bin/hdl_dump"
-printf '%s\n' "ps2homebrew/hdl-dump @ $hdl_commit" > "$project_root/tools/hdl-dump/bin/BUILD-SOURCE.txt"
+printf '%s\n' "ps2homebrew/hdl-dump @ $hdl_commit" "patch=$hdl_patch_rev" > "$project_root/tools/hdl-dump/bin/BUILD-SOURCE.txt"
 
 # ----- application ------------------------------------------------------------
-echo "==> Building PS2 HDD Manager 0.5.0-alpha"
+echo "==> Building PS2 HDD Manager 0.1.0-alpha"
 chmod +x "$project_root/build_fedora.sh" "$project_root/fetch_payloads.sh" "$project_root/create_freedvdboot_iso.sh"
 "$project_root/build_fedora.sh"
 
@@ -158,7 +302,7 @@ rm -rf "$smoke_dir"; trap - EXIT
 
 cat <<DONE
 
-PS2 HDD Manager 0.5.0-alpha preparation complete.
+PS2 HDD Manager 0.1.0-alpha preparation complete.
 Nothing was written to a physical HDD.
 
 Persistent cache: $cache_root

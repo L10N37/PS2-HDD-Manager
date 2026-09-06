@@ -1,10 +1,12 @@
 #include "core/FhdbConfig.h"
 #include "core/PhysicalDisk.h"
 #include "core/Ps2Apa.h"
+#include "core/Ps2ApaBank.h"
 #include "core/Ps2HddFormat.h"
 #include "core/Ps2HddLayout.h"
 #include "core/OplConfig.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <array>
 #include <cctype>
@@ -21,6 +23,9 @@
 
 #ifdef __linux__
 #include <fcntl.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -43,6 +48,8 @@ struct Options
     std::string installGame;
     std::string gameName;
     std::string media;
+    int bank = -1;
+    bool extendedBanks = false;
     bool listGames = false;
     bool listPfs = false;
     bool ensureCoverArt = false;
@@ -95,6 +102,7 @@ Options parseOptions(int argc, char **argv)
         if (argument == "--list-games") { options.listGames = true; continue; }
         if (argument == "--list-pfs") { options.listPfs = true; continue; }
         if (argument == "--ensure-cover-art") { options.ensureCoverArt = true; continue; }
+        if (argument == "--extended-banks") { options.extendedBanks = true; continue; }
         if (index + 1 >= argc)
             usage(argv[0]);
         const std::string value = argv[++index];
@@ -107,6 +115,7 @@ Options parseOptions(int argc, char **argv)
         else if (argument == "--install-game") options.installGame = value;
         else if (argument == "--game-name") options.gameName = value;
         else if (argument == "--media") options.media = value;
+        else if (argument == "--bank") options.bank = std::stoi(value);
         else if (argument == "--partition") options.pfsPartition = value;
         else if (argument == "--pfs-path") options.pfsPath = value;
         else if (argument == "--copy-manifest") options.copyManifest = value;
@@ -140,6 +149,8 @@ Options parseOptions(int argc, char **argv)
     if (physicalMode && options.provision.any() && options.payloadDirectory.empty())
         usage(argv[0]);
     if ((listPfsMode || copyPfsMode || coverArtMode) && (options.pfsPartition.empty() || options.pfsPath.find('\n') != std::string::npos))
+        usage(argv[0]);
+    if (options.bank < -1 || options.bank >= static_cast<int>(Ps2::HddLayoutPlanner::MaximumBankCount))
         usage(argv[0]);
     return options;
 }
@@ -401,6 +412,8 @@ private:
     fs::path path_;
 };
 
+Ps2::PhysicalDiskCandidate requeryTarget(const Options &options);
+
 bool sameCanonicalDevice(const std::string &source, const std::string &target)
 {
     if (source.rfind("/dev/", 0) != 0)
@@ -453,6 +466,311 @@ bool targetHasKernelHolders(const std::string &target)
     if (!fs::is_directory(holders, error))
         return false;
     return fs::directory_iterator(holders, error) != fs::directory_iterator();
+}
+
+bool isDirectPartitionOfTarget(const std::string &source, const std::string &target)
+{
+    if (source.size() <= target.size() || source.compare(0, target.size(), target) != 0)
+        return false;
+    for (std::size_t i = target.size(); i < source.size(); ++i)
+        if (source[i] < '0' || source[i] > '9')
+            return false;
+    return true;
+}
+
+bool sourceBelongsToTarget(const std::string &source, const std::string &target)
+{
+    return sameCanonicalDevice(source, target) || isDirectPartitionOfTarget(source, target);
+}
+
+std::string decodeMountInfoPath(std::string value)
+{
+    struct Escape { const char *encoded; char decoded; };
+    static const Escape escapes[] = {
+        { "\\040", ' ' }, { "\\011", '\t' }, { "\\012", '\n' }, { "\\134", '\\' }
+    };
+    for (const Escape &escape : escapes)
+    {
+        std::size_t pos = 0;
+        while ((pos = value.find(escape.encoded, pos)) != std::string::npos)
+        {
+            value.replace(pos, 4, 1, escape.decoded);
+            ++pos;
+        }
+    }
+    return value;
+}
+
+std::vector<std::string> targetMountPoints(const std::string &target)
+{
+    std::vector<std::string> mounts;
+    std::ifstream mountInfo("/proc/self/mountinfo");
+    std::string line;
+    while (std::getline(mountInfo, line))
+    {
+        const std::size_t separator = line.find(" - ");
+        if (separator == std::string::npos)
+            continue;
+
+        std::istringstream head(line.substr(0, separator));
+        std::string mountId, parentId, deviceNumber, root, mountPoint;
+        if (!(head >> mountId >> parentId >> deviceNumber >> root >> mountPoint))
+            continue;
+
+        std::istringstream tail(line.substr(separator + 3));
+        std::string filesystemType, source;
+        if (!(tail >> filesystemType >> source))
+            continue;
+        source = decodeMountInfoPath(source);
+        if (sourceBelongsToTarget(source, target))
+            mounts.push_back(decodeMountInfoPath(mountPoint));
+    }
+    std::sort(mounts.begin(), mounts.end(), [](const std::string &a, const std::string &b) {
+        return a.size() > b.size();
+    });
+    mounts.erase(std::unique(mounts.begin(), mounts.end()), mounts.end());
+    return mounts;
+}
+
+bool targetTreeIsMounted(const std::string &target)
+{
+    return !targetMountPoints(target).empty();
+}
+
+bool targetTreeIsSwap(const std::string &target)
+{
+    std::ifstream swaps("/proc/swaps");
+    std::string line;
+    std::getline(swaps, line);
+    while (std::getline(swaps, line))
+    {
+        std::istringstream fields(line);
+        std::string source;
+        if (fields >> source && sourceBelongsToTarget(source, target))
+            return true;
+    }
+    return false;
+}
+
+bool blockNodeHasHolders(const fs::path &node)
+{
+    const fs::path holders = node / "holders";
+    std::error_code error;
+    if (!fs::is_directory(holders, error))
+        return false;
+    return fs::directory_iterator(holders, error) != fs::directory_iterator();
+}
+
+bool targetTreeHasKernelHolders(const std::string &target)
+{
+    const std::string diskName = fs::path(target).filename().string();
+    const fs::path blockRoot("/sys/class/block");
+    if (blockNodeHasHolders(blockRoot / diskName))
+        return true;
+
+    std::error_code error;
+    for (const auto &entry : fs::directory_iterator(blockRoot, error))
+    {
+        const std::string name = entry.path().filename().string();
+        if (name.size() <= diskName.size() || name.compare(0, diskName.size(), diskName) != 0)
+            continue;
+        bool numericSuffix = true;
+        for (std::size_t i = diskName.size(); i < name.size(); ++i)
+            if (name[i] < '0' || name[i] > '9') { numericSuffix = false; break; }
+        if (numericSuffix && blockNodeHasHolders(entry.path()))
+            return true;
+    }
+    return false;
+}
+
+bool numericProcessDirectory(const std::string &name)
+{
+    if (name.empty()) return false;
+    return std::all_of(name.begin(), name.end(),
+            [](unsigned char ch) { return ch >= '0' && ch <= '9'; });
+}
+
+bool pathWithinMount(std::string path, const std::string &mountPoint)
+{
+    static const std::string deletedSuffix = " (deleted)";
+    if (path.size() > deletedSuffix.size() &&
+            path.compare(path.size() - deletedSuffix.size(),
+                         deletedSuffix.size(), deletedSuffix) == 0)
+        path.resize(path.size() - deletedSuffix.size());
+    return path == mountPoint ||
+            (path.size() > mountPoint.size() &&
+             path.compare(0, mountPoint.size(), mountPoint) == 0 &&
+             path[mountPoint.size()] == '/');
+}
+
+struct BusyProcess {
+    int pid = -1;
+    std::string name;
+};
+
+std::vector<BusyProcess> processesUsingMount(const std::string &mountPoint)
+{
+    std::vector<BusyProcess> out;
+    std::error_code error;
+    for (const auto &entry : fs::directory_iterator("/proc", error)) {
+        const std::string pidText = entry.path().filename().string();
+        if (!numericProcessDirectory(pidText)) continue;
+
+        bool holds = false;
+        auto checkLink = [&](const fs::path &link) {
+            std::error_code linkError;
+            const fs::path target = fs::read_symlink(link, linkError);
+            if (!linkError && pathWithinMount(target.string(), mountPoint))
+                holds = true;
+        };
+
+        checkLink(entry.path() / "cwd");
+        if (!holds) checkLink(entry.path() / "root");
+        if (!holds) {
+            const fs::path fdDir = entry.path() / "fd";
+            std::error_code fdError;
+            for (const auto &fd : fs::directory_iterator(fdDir, fdError)) {
+                checkLink(fd.path());
+                if (holds) break;
+            }
+        }
+        if (!holds) continue;
+
+        BusyProcess process;
+        try { process.pid = std::stoi(pidText); }
+        catch (...) { continue; }
+
+        std::ifstream comm(entry.path() / "comm");
+        std::getline(comm, process.name);
+        if (process.name.empty()) process.name = "unknown";
+        out.push_back(std::move(process));
+    }
+
+    std::sort(out.begin(), out.end(),
+            [](const BusyProcess &a, const BusyProcess &b) { return a.pid < b.pid; });
+    out.erase(std::unique(out.begin(), out.end(),
+            [](const BusyProcess &a, const BusyProcess &b) { return a.pid == b.pid; }),
+            out.end());
+    return out;
+}
+
+void unmountTargetFilesystems(const std::string &target)
+{
+    const auto mounts = targetMountPoints(target);
+    for (const std::string &mountPoint : mounts) {
+        std::cout << "STAGE: Unmounting existing target filesystem at "
+                  << mountPoint << "...\n" << std::flush;
+
+        int lastError = 0;
+        bool unmounted = false;
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            if (umount2(mountPoint.c_str(), 0) == 0 ||
+                    errno == EINVAL || errno == ENOENT) {
+                unmounted = true;
+                break;
+            }
+            lastError = errno;
+            if (lastError != EBUSY) break;
+            usleep(250000);
+        }
+        if (unmounted) continue;
+
+        std::ostringstream message;
+        if (lastError == EBUSY) {
+            message << "TARGET_BUSY: " << mountPoint << " is still in use.";
+            const auto holders = processesUsingMount(mountPoint);
+            if (!holders.empty()) {
+                message << "\nClose these process(es), then click Retry:";
+                for (const BusyProcess &process : holders)
+                    message << "\n  PID " << process.pid << "  " << process.name;
+            } else {
+                message << "\nClose Dolphin, Double Commander, or any terminal "
+                           "currently browsing this drive, then click Retry.";
+            }
+        } else {
+            message << "REFUSED: could not unmount " << mountPoint
+                    << ": " << std::strerror(lastError);
+        }
+        throw std::runtime_error(message.str());
+    }
+
+    if (targetTreeIsMounted(target))
+        throw std::runtime_error(
+                "TARGET_BUSY: one or more target partitions remain mounted. "
+                "Close Dolphin, Double Commander, or any terminal using the drive, then click Retry.");
+}
+
+void writeAllAt(int fd, std::uint64_t offset, const void *buffer, std::size_t length)
+{
+    const auto *data = static_cast<const unsigned char *>(buffer);
+    std::size_t done = 0;
+    while (done < length)
+    {
+        const ssize_t amount = pwrite(fd, data + done, length - done,
+                static_cast<off_t>(offset + done));
+        if (amount < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            throw std::runtime_error("Clearing the old host partition table failed: " + std::string(std::strerror(errno)));
+        }
+        if (amount == 0)
+            throw std::runtime_error("Clearing the old host partition table made no forward progress.");
+        done += static_cast<std::size_t>(amount);
+    }
+}
+
+void clearHostPartitionTable(const std::string &target, std::uint64_t sizeBytes)
+{
+    constexpr std::size_t WipeBytes = 1024U * 1024U;
+    if (sizeBytes < WipeBytes * 2ULL)
+        throw std::runtime_error("Target is unexpectedly too small for guarded partition-table clearing.");
+
+    const int fd = open(target.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        throw std::runtime_error("Opening target to clear the existing host partition table failed: " + std::string(std::strerror(errno)));
+
+    try
+    {
+        std::vector<unsigned char> zero(WipeBytes, 0);
+        writeAllAt(fd, 0, zero.data(), zero.size());
+        writeAllAt(fd, sizeBytes - WipeBytes, zero.data(), zero.size());
+        if (fsync(fd) != 0)
+            throw std::runtime_error("Flushing cleared partition-table sectors failed: " + std::string(std::strerror(errno)));
+        if (ioctl(fd, BLKRRPART) != 0)
+            throw std::runtime_error("Kernel still has the old partition table busy (close Dolphin/Double Commander and retry): " + std::string(std::strerror(errno)));
+    }
+    catch (...)
+    {
+        close(fd);
+        throw;
+    }
+    close(fd);
+}
+
+void prepareTargetForFormat(const Options &options)
+{
+    const Ps2::PhysicalDiskCandidate before = requeryTarget(options);
+    if (before.size != options.expectedSize || !before.systemDiskCheckAvailable ||
+            before.containsSystemVolume || before.containsBootPartition || before.readOnly)
+        throw std::runtime_error("REFUSED: target identity or safety state changed before partition-table clearing.");
+    if (targetTreeIsSwap(options.device))
+        throw std::runtime_error("REFUSED: a target partition is active swap. Disable swap before formatting this disk.");
+    if (targetTreeHasKernelHolders(options.device))
+        throw std::runtime_error("REFUSED: target or one of its partitions is in use by a kernel block-device holder.");
+
+    unmountTargetFilesystems(options.device);
+    std::cout << "STAGE: Clearing existing MBR/GPT partition-table signatures...\n" << std::flush;
+    clearHostPartitionTable(options.device, options.expectedSize);
+
+    for (int attempt = 0; attempt < 20; ++attempt)
+    {
+        const Ps2::PhysicalDiskCandidate refreshed = requeryTarget(options);
+        if (refreshed.partitionCount == 0)
+            return;
+        usleep(100000);
+    }
+    throw std::runtime_error("Kernel still reports host partitions after the formatter cleared the partition table.");
 }
 
 std::string runPfsshell(const std::string &executable, const std::string &script)
@@ -547,6 +865,34 @@ std::string runPfsshell(const std::string &executable, const std::string &script
     return log;
 }
 
+std::string bankedDevicePath(const Options &options, int bank)
+{
+    if (bank < 0) bank = 0;
+    const std::uint64_t sectors = options.expectedSize / Ps2::HddLayoutPlanner::SectorSize;
+    if (bank == 0 && sectors <= Ps2::HddLayoutPlanner::MaximumApaSectorCount) return options.device;
+    return "bank" + std::to_string(bank) + ":" + options.device;
+}
+
+std::uint32_t plannedBankCount(const Options &options)
+{
+    const auto layout = Ps2::HddLayoutPlanner::Plan(options.expectedSize, Ps2::HddLayoutMode::ExtendedApaBanks);
+    return layout.valid ? static_cast<std::uint32_t>(layout.banks.size()) : 0;
+}
+
+bool bankHasValidMbr(const Options &options, std::uint32_t bank)
+{
+    const auto probes = Ps2::Apa::ProbePhysicalDrive(options.device, options.expectedSize, bank + 1);
+    return bank < probes.size() && probes[bank].header.state == Ps2::ApaHeaderState::Valid;
+}
+
+void verifyGameBank(const Options &options, int bank)
+{
+    if (bank < 0) bank = 0;
+    if (static_cast<std::uint32_t>(bank) >= plannedBankCount(options)) throw std::runtime_error("Requested bank is outside the disk.");
+    if (!bankHasValidMbr(options, static_cast<std::uint32_t>(bank))) throw std::runtime_error("Requested bank has no valid APA MBR. Format as Extended APA Banks first.");
+    if (bank == 0) Ps2::Ps2HddFormat::VerifyStandardApaDisk(options.device, options.expectedSize);
+}
+
 std::string runHdlDumpInstall(const Options &options)
 {
     int outputPipe[2];
@@ -564,8 +910,9 @@ std::string runHdlDumpInstall(const Options &options)
         close(outputPipe[0]);
         close(outputPipe[1]);
         const char *command = options.media == "cd" ? "inject_cd" : "inject_dvd";
+        const std::string target = bankedDevicePath(options, options.bank < 0 ? 0 : options.bank);
         execl(options.hdlDump.c_str(), options.hdlDump.c_str(), command,
-                options.device.c_str(), options.gameName.c_str(), options.installGame.c_str(),
+                target.c_str(), options.gameName.c_str(), options.installGame.c_str(),
                 static_cast<char*>(nullptr));
         _exit(127);
     }
@@ -600,7 +947,7 @@ std::string runHdlDumpInstall(const Options &options)
     return log;
 }
 
-std::string runHdlDumpToc(const Options &options)
+std::string runHdlDumpToc(const Options &options, int bank)
 {
     int outputPipe[2];
     if (pipe(outputPipe) != 0)
@@ -613,8 +960,9 @@ std::string runHdlDumpToc(const Options &options)
         dup2(outputPipe[1], STDOUT_FILENO);
         dup2(outputPipe[1], STDERR_FILENO);
         close(outputPipe[0]); close(outputPipe[1]);
+        const std::string target = bankedDevicePath(options, bank);
         execl(options.hdlDump.c_str(), options.hdlDump.c_str(), "hdl_toc",
-                options.device.c_str(), "--csv", static_cast<char*>(nullptr));
+                target.c_str(), "--csv", static_cast<char*>(nullptr));
         _exit(127);
     }
     close(outputPipe[1]);
@@ -671,7 +1019,7 @@ std::vector<std::string> splitCsvLimit(const std::string &line, std::size_t fiel
     return fields;
 }
 
-void emitGameRecords(const std::string &toc)
+void emitGameRecords(const std::string &toc, int bank)
 {
     std::istringstream lines(toc);
     std::string line;
@@ -683,7 +1031,7 @@ void emitGameRecords(const std::string &toc)
         std::string size = f[1];
         if (size.size() >= 2 && size.substr(size.size() - 2) == "KB")
             size.resize(size.size() - 2);
-        std::cout << "GAME\t" << f[0] << "\t" << trim(size) << "\t"
+        std::cout << "GAME\t" << bank << "\t" << f[0] << "\t" << trim(size) << "\t"
                   << cleanField(f[4]) << "\t" << cleanField(f[5]) << "\n";
     }
 }
@@ -717,7 +1065,7 @@ std::string resolvePfsPartition(const Options &options)
         return options.pfsPartition;
 
     const std::string log = runPfsshell(options.pfsshell,
-            "device " + options.device + "\nls\nexit\n");
+            "device " + bankedDevicePath(options, 0) + "\nls\nexit\n");
     if (log.find("PP.FHDB.APPS") != std::string::npos)
         return "PP.FHDB.APPS";
     if (log.find("+OPL") != std::string::npos)
@@ -744,7 +1092,7 @@ void emitPfsRecords(const Options &options)
     const std::string path = options.pfsPath == "@opl"
             ? (partition == "+OPL" ? "/" : "/OPL")
             : normalizedPfsPath(options.pfsPath);
-    std::string script = "device " + options.device + "\nmount " + partition + "\ncd " +
+    std::string script = "device " + bankedDevicePath(options, 0) + "\nmount " + partition + "\ncd " +
             quotePfsshellToken(path) + "\nls -l\numount\nexit\n";
     const std::string log = runPfsshell(options.pfsshell, script);
     std::cout << "OPL_PARTITION\t" << partition << "\n";
@@ -857,7 +1205,7 @@ void copyManifestToPfs(const Options &options)
 {
     const std::string partition = resolvePfsPartition(options);
     const std::vector<ManifestEntry> entries = readCopyManifest(options.copyManifest);
-    std::string script = "device " + options.device + "\nmount " + partition + "\n";
+    std::string script = "device " + bankedDevicePath(options, 0) + "\nmount " + partition + "\n";
 
     // pfsshell's `put` command uses one filename for both the host source and
     // PFS destination. For a manifest entry that renames while copying (for
@@ -937,7 +1285,7 @@ void ensureCoverArtConfig(const Options &options)
     // accept a minimal config containing only the key we need to set.
     try
     {
-        std::string readScript = "device " + options.device + "\nmount " + partition + "\n";
+        std::string readScript = "device " + bankedDevicePath(options, 0) + "\nmount " + partition + "\n";
         readScript += "cd " + quotePfsshellToken(base) + "\n";
         readScript += "lcd " + quotePfsshellToken(temp.path().string()) + "\n";
         readScript += "get conf_opl.cfg\ncd /\numount\nexit\n";
@@ -968,7 +1316,7 @@ void ensureCoverArtConfig(const Options &options)
             throw std::runtime_error("Writing patched conf_opl.cfg failed.");
     }
 
-    std::string writeScript = "device " + options.device + "\nmount " + partition + "\n";
+    std::string writeScript = "device " + bankedDevicePath(options, 0) + "\nmount " + partition + "\n";
     appendEnsureDirectory(writeScript, base);
     writeScript += "lcd " + quotePfsshellToken(temp.path().string()) + "\n";
     writeScript += "put conf_opl.cfg\ncd /\numount\nexit\n";
@@ -1144,12 +1492,8 @@ void preflight(const Options &options)
         throw std::runtime_error("Formatter only accepts whole /dev/sdX or /dev/hdX disks.");
     validateBackendResources(options);
 
-    if (targetIsMounted(options.device))
-        throw std::runtime_error("REFUSED: target device is currently mounted.");
-    if (targetIsSwap(options.device))
-        throw std::runtime_error("REFUSED: target device is active swap.");
-    if (targetHasKernelHolders(options.device))
-        throw std::runtime_error("REFUSED: target device is in use by a kernel block-device holder.");
+    const bool formatRequest = options.installGame.empty() && !options.listGames && !options.listPfs &&
+            !options.ensureCoverArt && options.copyManifest.empty() && options.smokeImage.empty();
 
     const Ps2::PhysicalDiskCandidate disk = requeryTarget(options);
     if (!disk.inspectionError.empty())
@@ -1164,15 +1508,26 @@ void preflight(const Options &options)
         throw std::runtime_error("REFUSED: system-disk safety check is unavailable.");
     if (disk.containsSystemVolume || disk.containsBootPartition)
         throw std::runtime_error("REFUSED: target is part of the running system disk.");
-    if (disk.partitionCount != 0)
-        throw std::runtime_error("REFUSED: target has host-visible partitions. Use a RAW/APA disk.");
     if (disk.busType == "Virtual" || disk.busType == "File-backed virtual" ||
             disk.busType == "Storage Spaces")
         throw std::runtime_error("REFUSED: virtual/Storage Spaces disk target.");
 
+    if (targetTreeIsSwap(options.device))
+        throw std::runtime_error("REFUSED: target device or one of its partitions is active swap.");
+    if (targetTreeHasKernelHolders(options.device))
+        throw std::runtime_error("REFUSED: target device or one of its partitions is in use by a kernel block-device holder.");
+
+    if (!formatRequest)
+    {
+        if (targetTreeIsMounted(options.device))
+            throw std::runtime_error("REFUSED: target device or one of its partitions is currently mounted.");
+        if (disk.partitionCount != 0)
+            throw std::runtime_error("REFUSED: target has host-visible partitions and is not in a formatting operation.");
+    }
+
     const std::uint64_t sectors = disk.size / Ps2::HddLayoutPlanner::SectorSize;
-    if (sectors > Ps2::HddLayoutPlanner::BankBoundarySectors)
-        throw std::runtime_error("REFUSED: standard APA formatter currently accepts only one <=2 TiB bank.");
+    if (formatRequest && sectors > Ps2::HddLayoutPlanner::MaximumApaSectorCount && !options.extendedBanks)
+        throw std::runtime_error("REFUSED: disks above the standard APA limit require Extended APA Banks mode.");
 #endif
 }
 
@@ -1222,10 +1577,17 @@ int main(int argc, char **argv)
 #ifdef __linux__
         if (options.listGames)
         {
-            std::cout << "STAGE: Safely reading installed HDL game table...\n" << std::flush;
+            std::cout << "STAGE: Safely reading installed HDL game table across APA banks...\n" << std::flush;
             preflight(options);
             Ps2::Ps2HddFormat::VerifyStandardApaDisk(options.device, options.expectedSize);
-            emitGameRecords(runHdlDumpToc(options));
+            const std::uint32_t count = plannedBankCount(options);
+            const int first = options.bank >= 0 ? options.bank : 0;
+            const int last = options.bank >= 0 ? options.bank + 1 : static_cast<int>(count);
+            for (int bank = first; bank < last; ++bank)
+            {
+                if (!bankHasValidMbr(options, static_cast<std::uint32_t>(bank))) continue;
+                emitGameRecords(runHdlDumpToc(options, bank), bank);
+            }
             std::cout << "PS2 HDD Writer: GAME LIST SUCCESS\n";
             return 0;
         }
@@ -1262,13 +1624,14 @@ int main(int argc, char **argv)
         {
             std::cout << "STAGE: Re-checking target identity and safety for HDL game install...\n" << std::flush;
             preflight(options);
-            std::cout << "STAGE: Verifying standard APA before HDL game install...\n" << std::flush;
-            Ps2::Ps2HddFormat::VerifyStandardApaDisk(options.device, options.expectedSize);
+            const int bank = options.bank < 0 ? 0 : options.bank;
+            std::cout << "STAGE: Verifying APA Bank " << bank << " before HDL game install...\n" << std::flush;
+            verifyGameBank(options, bank);
             std::cout << "STAGE: Installing " << options.gameName << " as "
-                      << (options.media == "cd" ? "CD" : "DVD") << " HDL game...\n" << std::flush;
+                      << (options.media == "cd" ? "CD" : "DVD") << " HDL game into Bank " << bank << "...\n" << std::flush;
             runHdlDumpInstall(options);
-            std::cout << "STAGE: Re-reading HDL game table...\n" << std::flush;
-            const std::string toc = runHdlDumpToc(options);
+            std::cout << "STAGE: Re-reading HDL game table in Bank " << bank << "...\n" << std::flush;
+            const std::string toc = runHdlDumpToc(options, bank);
             if (toc.find(options.gameName) == std::string::npos)
                 throw std::runtime_error("HDL install completed but the new game was not found in hdl_toc verification.");
             std::cout << "PS2 HDD Writer: GAME INSTALL SUCCESS: " << options.gameName << "\n";
@@ -1284,6 +1647,7 @@ int main(int argc, char **argv)
         std::cout << "STAGE: Re-checking target identity and safety...\n" << std::flush;
         preflight(options);
 #ifdef __linux__
+        prepareTargetForFormat(options);
         TemporaryDirectory staging;
         if (options.provision.any())
         {
@@ -1291,26 +1655,39 @@ int main(int argc, char **argv)
             stageProvisionPayloads(options, staging.path());
         }
 
-        std::cout << "STAGE: Fast-initializing standard APA/PFS layout...\n" << std::flush;
-        runPfsshell(options.pfsshell,
-                Ps2::Ps2HddFormat::BuildStandardFormatScript(options.device));
+        const std::string bank0Device = bankedDevicePath(options, 0);
+        std::cout << "STAGE: Fast-initializing conventional APA/PFS Bank 0...\n" << std::flush;
+        runPfsshell(options.pfsshell, Ps2::Ps2HddFormat::BuildStandardFormatScript(bank0Device));
 
         const Ps2::PhysicalDiskCandidate afterFormat = requeryTarget(options);
         if (!afterFormat.systemDiskCheckAvailable || afterFormat.size != options.expectedSize ||
                 afterFormat.logicalSectorSize != 512 || afterFormat.readOnly ||
                 afterFormat.containsSystemVolume || afterFormat.containsBootPartition ||
-                targetIsMounted(options.device) || targetIsSwap(options.device) ||
-                targetHasKernelHolders(options.device))
+                targetTreeIsMounted(options.device) || targetTreeIsSwap(options.device) ||
+                targetTreeHasKernelHolders(options.device))
             throw std::runtime_error("REFUSED: target identity or safety state changed after APA formatting.");
 
-        std::cout << "STAGE: Verifying fresh APA partition chain...\n" << std::flush;
+        std::cout << "STAGE: Verifying fresh Bank-0 APA partition chain...\n" << std::flush;
         Ps2::Ps2HddFormat::VerifyStandardApaDisk(options.device, options.expectedSize);
+
+        if (options.extendedBanks)
+        {
+            const auto layout = Ps2::HddLayoutPlanner::Plan(options.expectedSize, Ps2::HddLayoutMode::ExtendedApaBanks);
+            if (!layout.valid || layout.banks.size() < 2) throw std::runtime_error("Extended mode has no upper APA bank.");
+            for (std::size_t i = 1; i < layout.banks.size(); ++i)
+            {
+                std::cout << "STAGE: Initializing games-only APA Bank " << i << "...\n" << std::flush;
+                Ps2::ApaBank::InitializeGamesOnly(options.device, options.expectedSize, static_cast<std::uint32_t>(i), true);
+                const auto chain = Ps2::Apa::ReadPartitionChain(options.device, layout.banks[i].baseSector, layout.banks[i].addressableSectorCount, 256);
+                if (chain.empty() || chain.front().header.id != "__mbr") throw std::runtime_error("Upper APA bank verification failed.");
+            }
+        }
 
         if (options.provision.any())
         {
             std::cout << "STAGE: Creating OPL/FHDB folders and copying selected applications...\n" << std::flush;
             runPfsshell(options.pfsshell,
-                    Ps2::Ps2HddFormat::BuildProvisionScript(options.device,
+                    Ps2::Ps2HddFormat::BuildProvisionScript(bank0Device,
                             staging.path().string(), options.provision));
 
             if (options.provision.installFhdb)
@@ -1322,15 +1699,15 @@ int main(int argc, char **argv)
 
             std::cout << "STAGE: Verifying provisioned PFS folders...\n" << std::flush;
             runPfsshell(options.pfsshell,
-                    Ps2::Ps2HddFormat::BuildProvisionVerifyScript(options.device,
+                    Ps2::Ps2HddFormat::BuildProvisionVerifyScript(bank0Device,
                             options.provision));
         }
 
         std::cout << "STAGE: Final PFS mount verification...\n" << std::flush;
         runPfsshell(options.pfsshell,
-                Ps2::Ps2HddFormat::BuildStandardVerifyScript(options.device));
+                Ps2::Ps2HddFormat::BuildStandardVerifyScript(bank0Device));
 
-        std::cout << "PS2 HDD Writer: SUCCESS. Standard APA/PFS format verified";
+        std::cout << "PS2 HDD Writer: SUCCESS. " << (options.extendedBanks ? "Extended banked APA + Bank-0 PFS format verified" : "Standard APA/PFS format verified");
         if (options.provision.any())
             std::cout << " and selected OPL/FHDB applications provisioned";
         std::cout << ".\n";

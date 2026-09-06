@@ -184,10 +184,8 @@ void Ps2HddFormat::VerifyStandardApaDisk(const std::string &targetPath,
         throw std::invalid_argument("Standard APA verification requires a sector-aligned disk size.");
 
     const std::uint64_t sectors = diskSizeBytes / HddLayoutPlanner::SectorSize;
-    if (sectors > HddLayoutPlanner::BankBoundarySectors)
-        throw std::runtime_error("Standard APA verification refuses disks larger than one 32-bit APA bank.");
-
-    const std::vector<ApaPartitionProbe> chain = Apa::ReadPartitionChain(targetPath, 0, sectors, 256);
+    const std::uint64_t bank0Sectors = std::min<std::uint64_t>(sectors, HddLayoutPlanner::MaximumApaSectorCount);
+    const std::vector<ApaPartitionProbe> chain = Apa::ReadPartitionChain(targetPath, 0, bank0Sectors, 256);
     if (chain.size() < 5)
         throw std::runtime_error("Fresh APA layout is missing required system partitions.");
 
