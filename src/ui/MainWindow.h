@@ -6,6 +6,7 @@
 #include <QHash>
 #include <QSet>
 #include <vector>
+#include <functional>
 
 #include "core/PhysicalDisk.h"
 
@@ -79,7 +80,8 @@ private:
     bool selectedDiskCanBrowsePfs(QString *reason = nullptr) const;
 
     bool runPrivilegedWriter(const Ps2::PhysicalDiskCandidate &disk, const QStringList &modeArguments,
-            QString *output, bool parseProgress = false, const QString &progressPrefix = QString());
+            QString *output, bool parseProgress = false, const QString &progressPrefix = QString(),
+            const std::function<void(const QString &)> &outputCallback = {});
     void copyPcItemsToPfs(const QStringList &paths, QTreeWidgetItem *target);
     void applyRecommendedOplDefaults();
     void installOrUpdateOplApps();
@@ -127,6 +129,25 @@ private:
     int batchGameCount = 0;
     PrivilegedSession *privilegedSession = nullptr;
     QNetworkAccessManager *network = nullptr;
+
+    // Synchronous raw-HDD operations keep the Qt UI responsive by pumping the
+    // event loop. These guards prevent a queued refresh/disk-selection event
+    // from clearing QTreeWidget items or rebuilding the disk vector while the
+    // current stack still owns pointers/references into them.
+    bool hddOperationInProgress = false;
+    bool ps2RefreshInProgress = false;
+    bool ps2RefreshPending = false;
+    bool diskRescanPending = false;
+
+    // Incremented before every whole-tree clear/rebuild. Long-running helper
+    // calls capture this value and refuse to touch old QTreeWidgetItem pointers
+    // if another code path somehow replaced the tree while they were waiting.
+    quint64 ps2TreeGeneration = 0;
+
+    // True for the complete install queue, including the gaps between helper
+    // transactions. PC browsing/marking remains interactive; raw-HDD controls
+    // are held stable until the queue finishes.
+    bool transferQueueRunning = false;
 };
 
 #endif // MAINWINDOW_H

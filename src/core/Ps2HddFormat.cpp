@@ -138,6 +138,8 @@ PayloadStatus Ps2HddFormat::ValidateProvisionPayload(const std::string &payloadD
         required.emplace_back("fhdb-enabler/FHDB-Boot-Config.ELF");
     if (selection.installMemoryCardAnnihilator)
         required.emplace_back("mca/BOOT.ELF");
+    if (selection.installFceumm)
+        required.emplace_back("fceumm/BOOT.ELF");
 
     for (const fs::path &relative : required)
     {
@@ -185,7 +187,7 @@ void Ps2HddFormat::VerifyStandardApaDisk(const std::string &targetPath,
 
     const std::uint64_t sectors = diskSizeBytes / HddLayoutPlanner::SectorSize;
     const std::uint64_t bank0Sectors = std::min<std::uint64_t>(sectors, HddLayoutPlanner::MaximumApaSectorCount);
-    const std::vector<ApaPartitionProbe> chain = Apa::ReadPartitionChain(targetPath, 0, bank0Sectors, 256);
+    const std::vector<ApaPartitionProbe> chain = Apa::ReadPartitionChain(targetPath, 0, bank0Sectors, 0);
     if (chain.size() < 5)
         throw std::runtime_error("Fresh APA layout is missing required system partitions.");
 
@@ -201,26 +203,33 @@ void Ps2HddFormat::VerifyStandardApaDisk(const std::string &targetPath,
 }
 
 std::string Ps2HddFormat::BuildProvisionScript(const std::string &devicePath,
-        const std::string &stagingDirectory, const ProvisioningSelection &selection)
+        const std::string &stagingDirectory, const ProvisioningSelection &selection,
+        std::uint32_t appsSizeMiB)
 {
     requirePfsshellPath(devicePath, "device path");
     requirePfsshellPath(stagingDirectory, "staging path");
     if (!selection.any())
         return "device " + devicePath + "\nexit\n";
 
+    if (appsSizeMiB < MinimumAppsSizeMiB ||
+            appsSizeMiB > MaximumAppsSizeMiB ||
+            (appsSizeMiB % 128U) != 0)
+        throw std::invalid_argument(
+                "OPL Apps/ART/ROMS reserve must be 128 MiB aligned and between 128 MiB and 64 GiB.");
+
     std::string script = "device " + devicePath + "\n";
 
     if (selection.needsAppsPartition())
     {
-        // One 128 MiB PFS partition is both an FHDB-friendly application location and,
-        // via __common/OPL/conf_hdd.cfg, OPL's writable HDD data partition.
-        script += "mkpart PP.FHDB.APPS 128M PFS\n";
+        // Dedicated Bank-0 PFS storage for OPL, Apps, artwork, ROMs and saves.
+        script += "mkpart PP.FHDB.APPS " +
+                std::to_string(appsSizeMiB) + "M PFS\n";
 
         script += "mount __common\nmkdir OPL\ncd OPL\nlcd " + stagingDirectory +
                 "\nput conf_hdd.cfg\ncd /\numount\n";
 
         script += "mount PP.FHDB.APPS\nmkdir OPL\ncd OPL\n";
-        for (const char *folder : { "APPS", "ART", "CFG", "CHT", "LNG", "THM", "VMC" })
+        for (const char *folder : { "APPS", "ART", "CFG", "CHT", "LNG", "THM", "VMC", "ROMS", "SAVES" })
         {
             script += "mkdir ";
             script += folder;
@@ -253,6 +262,26 @@ std::string Ps2HddFormat::BuildProvisionScript(const std::string &devicePath,
                     "\nput FHDB_BOOT_CONFIG.ELF\nrename FHDB_BOOT_CONFIG.ELF BOOT.ELF\n"
                     "put title_fhdb_enabler.cfg\nrename title_fhdb_enabler.cfg title.cfg\ncd /OPL\n";
         }
+        if (selection.installFceumm)
+        {
+            script +=
+                    "cd ROMS\n"
+                    "mkdir NES\n"
+                    "cd /OPL\n"
+                    "cd SAVES\n"
+                    "mkdir FCEUMM\n"
+                    "cd /OPL\n"
+                    "cd APPS\n"
+                    "mkdir FCEUmm-PS2-SMB\n"
+                    "cd FCEUmm-PS2-SMB\n"
+                    "lcd " + stagingDirectory + "\n"
+                    "put FCEUMM_BOOT.ELF\n"
+                    "rename FCEUMM_BOOT.ELF BOOT.ELF\n"
+                    "put FCEUltra.cnf\n"
+                    "put title_fceumm.cfg\n"
+                    "rename title_fceumm.cfg title.cfg\n"
+                    "cd /OPL\n";
+        }
         script += "cd /\numount\n";
     }
 
@@ -281,7 +310,7 @@ std::string Ps2HddFormat::BuildProvisionVerifyScript(const std::string &devicePa
     if (selection.needsAppsPartition())
     {
         script += "mount __common\ncd OPL\nls\ncd /\numount\n";
-        script += "mount PP.FHDB.APPS\ncd OPL\nls\ncd APPS\nls\ncd /\numount\n";
+        script += "mount PP.FHDB.APPS\ncd OPL\nls\ncd APPS\nls\ncd /OPL/ROMS\nls\ncd /\numount\n";
     }
     if (selection.installFhdb)
     {

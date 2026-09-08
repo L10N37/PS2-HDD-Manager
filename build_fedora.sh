@@ -22,7 +22,7 @@ if ((${#missing[@]} != 0)); then
 fi
 
 cmake -S "$project_root" -B "$build_dir" -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DPS2_HDD_BUILD_GUI=ON
 cmake --build "$build_dir" --parallel
 ctest --test-dir "$build_dir" --output-on-failure

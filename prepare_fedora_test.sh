@@ -178,7 +178,7 @@ printf '%s\n' "ps2homebrew/pfsshell @ $pfsshell_commit" "patch=$pfsshell_patch_r
 
 # ----- hdl-dump ---------------------------------------------------------------
 hdl_commit="32c296c69cf9c263fcbe035004aa28c345b3b279"
-hdl_patch_rev="banked-hio-v1"
+hdl_patch_rev="banked-hio-v1+scan-progress-v2"
 hdl_key="${hdl_commit}-${hdl_patch_rev}"
 hdl_cache="$backend_cache/hdl-dump/$hdl_key"
 hdl_cached_bin="$hdl_cache/bin/hdl_dump"
@@ -280,6 +280,132 @@ if oldalloc not in s: raise SystemExit('hdl allocation missing')
 s=s.replace(oldalloc,newalloc,1)
 p.write_text(s)
 PYHDLBANK
+
+    # PS2 HDD Manager v14b: opt-in real scan progress for hdl_toc.
+    python3 - "$hdl_cache/source/hdl.c" <<'PYHDLSCANV14B'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+
+if '#include <stdlib.h>' not in s:
+    s = s.replace('#include <stdio.h>\n', '#include <stdio.h>\n#include <stdlib.h>\n', 1)
+
+old_sig = ('static int\n'
+           'hdl_glist_read_slice(hio_t *hio,\n'
+           '                     hdl_games_list_t *glist,\n'
+           '                     const apa_toc_t *toc,\n'
+           '                     int slice_index)\n'
+           '{')
+new_sig = ('static int\n'
+           'hdl_glist_read_slice(hio_t *hio,\n'
+           '                     hdl_games_list_t *glist,\n'
+           '                     const apa_toc_t *toc,\n'
+           '                     int slice_index,\n'
+           '                     size_t progress_total)\n'
+           '{')
+if old_sig in s:
+    s = s.replace(old_sig, new_sig, 1)
+elif new_sig not in s:
+    raise SystemExit('Could not patch hdl_glist_read_slice signature')
+
+old_loop = ('        if (get_u16(&part->flags) == 0x00 &&\n'
+            '            get_u16(&part->type) == PS2_HDL_PARTITION)\n'
+            '            result = hdl_ginfo_read(hio, slice_index, part,\n'
+            '                                    glist->games + glist->count++);\n')
+new_loop = ('        if (get_u16(&part->flags) == 0x00 &&\n'
+            '            get_u16(&part->type) == PS2_HDL_PARTITION) {\n'
+            '            result = hdl_ginfo_read(hio, slice_index, part,\n'
+            '                                    glist->games + glist->count++);\n'
+            '            if (getenv("PS2_HDD_SCAN_PROGRESS") != NULL &&\n'
+            '                strcmp(getenv("PS2_HDD_SCAN_PROGRESS"), "1") == 0) {\n'
+            '                fprintf(stderr, "HDL_SCAN_PROGRESS\\t%lu\\t%lu\\n",\n'
+            '                        (unsigned long)glist->count,\n'
+            '                        (unsigned long)progress_total);\n'
+            '                fflush(stderr);\n'
+            '            }\n'
+            '        }\n')
+if old_loop in s:
+    s = s.replace(old_loop, new_loop, 1)
+elif 'HDL_SCAN_PROGRESS' not in s:
+    raise SystemExit('Could not patch HDL game-header loop')
+
+old_count = ('        count = (hdl_games_count(toc->slice + 0) +\n'
+             '                 hdl_games_count(toc->slice + 1));\n\n'
+             '        tmp = osal_alloc(sizeof(hdl_game_info_t) * count);\n')
+new_count = ('        count = (hdl_games_count(toc->slice + 0) +\n'
+             '                 hdl_games_count(toc->slice + 1));\n\n'
+             '        if (getenv("PS2_HDD_SCAN_PROGRESS") != NULL &&\n'
+             '            strcmp(getenv("PS2_HDD_SCAN_PROGRESS"), "1") == 0) {\n'
+             '            fprintf(stderr, "HDL_SCAN_TOTAL\\t%lu\\n",\n'
+             '                    (unsigned long)count);\n'
+             '            fflush(stderr);\n'
+             '        }\n\n'
+             '        tmp = osal_alloc(sizeof(hdl_game_info_t) * count);\n')
+if old_count in s:
+    s = s.replace(old_count, new_count, 1)
+elif 'HDL_SCAN_TOTAL' not in s:
+    raise SystemExit('Could not patch HDL game total')
+
+s = s.replace('result = hdl_glist_read_slice(hio, *glist, toc, 0);',
+              'result = hdl_glist_read_slice(hio, *glist, toc, 0, count);', 1)
+s = s.replace('result = hdl_glist_read_slice(hio, *glist, toc, 1);',
+              'result = hdl_glist_read_slice(hio, *glist, toc, 1, count);', 1)
+
+for marker in ('HDL_SCAN_TOTAL', 'HDL_SCAN_PROGRESS', 'progress_total'):
+    if marker not in s:
+        raise SystemExit('hdl.c verification failed: ' + marker)
+
+p.write_text(s)
+PYHDLSCANV14B
+
+    python3 - "$hdl_cache/source/apa.c" <<'PYAPASCANV14B'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+start = s.find('static int\napa_slice_read(')
+end = s.find('\n\n/**************************************************************/\nstatic int\napa_toc_read_internal', start)
+if start < 0 or end < 0:
+    raise SystemExit('Could not isolate apa_slice_read')
+body = s[start:end]
+
+needle = ('                    ++count;\n'
+          '                    result = apa_part_add(slice, &part, 1, 1);\n')
+insert = ('                    ++count;\n'
+          '                    if (getenv("PS2_HDD_SCAN_PROGRESS") != NULL &&\n'
+          '                        strcmp(getenv("PS2_HDD_SCAN_PROGRESS"), "1") == 0) {\n'
+          '                        fprintf(stderr, "APA_SCAN_PROGRESS\\t%d\\t%u\\t%u\\n",\n'
+          '                                slice_index, sector, total_sectors);\n'
+          '                        fflush(stderr);\n'
+          '                    }\n'
+          '                    result = apa_part_add(slice, &part, 1, 1);\n')
+if needle in body:
+    body = body.replace(needle, insert, 1)
+elif 'APA_SCAN_PROGRESS' not in body:
+    raise SystemExit('Could not patch APA chain progress')
+
+ret = '    return (result);\n}'
+done = ('    if (getenv("PS2_HDD_SCAN_PROGRESS") != NULL &&\n'
+        '        strcmp(getenv("PS2_HDD_SCAN_PROGRESS"), "1") == 0 &&\n'
+        '        result == RET_OK) {\n'
+        '        fprintf(stderr, "APA_SCAN_DONE\\t%d\\t%u\\n",\n'
+        '                slice_index, total_sectors);\n'
+        '        fflush(stderr);\n'
+        '    }\n\n'
+        '    return (result);\n'
+        '}')
+if ret in body:
+    body = body.replace(ret, done, 1)
+elif 'APA_SCAN_DONE' not in body:
+    raise SystemExit('Could not patch APA completion')
+
+s = s[:start] + body + s[end:]
+p.write_text(s)
+PYAPASCANV14B
+
     make -C "$hdl_cache/source" RELEASE=yes
     mkdir -p "$hdl_cache/bin"
     install -m 0755 "$hdl_cache/source/hdl_dump" "$hdl_cached_bin"

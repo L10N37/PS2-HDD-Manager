@@ -1,7 +1,9 @@
 #include "PrivilegedSession.h"
+#include "DebugTrace.h"
 
 #include <QApplication>
 #include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFileInfo>
 #include <QMessageBox>
 #include <QProcess>
@@ -88,6 +90,10 @@ bool PrivilegedSession::waitForHandshake(QWidget *dialogParent)
 
 bool PrivilegedSession::unlock(QWidget *dialogParent)
 {
+    PS2_TRACE_SCOPE("PrivilegedSession::unlock");
+    DebugTrace::write(
+            std::string("PrivilegedSession::unlock isUnlocked=") +
+            (isUnlocked() ? "1" : "0"));
 #ifndef __linux__
     Q_UNUSED(dialogParent);
     errorText = "Persistent raw-HDD privilege sessions are currently Fedora/Linux only.";
@@ -133,12 +139,17 @@ void PrivilegedSession::lock()
     const bool wasUnlocked = process->state() != QProcess::NotRunning;
     if (process->state() == QProcess::Running) {
         process->closeWriteChannel(); // EOF tells the root helper to exit.
-        if (!process->waitForFinished(1000)) {
+        if (!process->waitForFinished(1500)) {
             process->terminate();
-            if (!process->waitForFinished(500)) process->kill();
+            if (!process->waitForFinished(750)) {
+                process->kill();
+                // During application shutdown there may be no later event-loop
+                // turn. Reap the helper synchronously before destroying QProcess.
+                process->waitForFinished(1500);
+            }
         }
     }
-    process->deleteLater();
+    delete process;
     process = nullptr;
     responseBuffer.clear();
     busy = false;
@@ -183,6 +194,17 @@ bool PrivilegedSession::parseResponse(QByteArray &buffer, QString *output,
 bool PrivilegedSession::run(const QStringList &modeArguments, QString *output,
         const std::function<void(const QString &)> &outputCallback)
 {
+    PS2_TRACE_SCOPE("PrivilegedSession::run");
+    DebugTrace::write(
+            "PrivilegedSession::run args=[" +
+            modeArguments.join(" ").toStdString() +
+            "] state=" +
+            std::to_string(
+                process
+                    ? static_cast<int>(process->state())
+                    : -1) +
+            " busy=" +
+            std::to_string(busy));
 #ifndef __linux__
     Q_UNUSED(modeArguments); Q_UNUSED(output); Q_UNUSED(outputCallback);
     errorText = "Persistent raw-HDD privilege sessions are currently Fedora/Linux only.";
@@ -234,6 +256,8 @@ bool PrivilegedSession::run(const QStringList &modeArguments, QString *output,
     int code = -1;
     while (!done) {
         if (!process || process->state() == QProcess::NotRunning) {
+            DebugTrace::write(
+                    "PrivilegedSession::run: helper exited unexpectedly");
             errorText = "The privileged PS2 HDD helper exited unexpectedly.";
             if (process) {
                 const QString stderrText = QString::fromLocal8Bit(process->readAllStandardError()).trimmed();
@@ -256,6 +280,9 @@ bool PrivilegedSession::run(const QStringList &modeArguments, QString *output,
         process->waitForFinished(10);
     }
     busy = false;
+    DebugTrace::write(
+            "PrivilegedSession::run: completed exitCode=" +
+            std::to_string(code));
     return code == 0;
 #endif
 }
