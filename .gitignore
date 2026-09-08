@@ -31,6 +31,7 @@ payload/runtime/
 .mixed-bank-queue-v6-backup-*/
 
 # Local hardware-test / release artifacts.
+/.verified-skip-v3-backup-*/
 /.hdl-inject-v4-backup-*/
 /.hdd-read-crash-v5-backup-*/
 /.responsive-live-queue-v6-backup-*/
