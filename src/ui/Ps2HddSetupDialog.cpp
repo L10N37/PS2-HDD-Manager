@@ -76,12 +76,39 @@ Ps2HddSetupDialog::Ps2HddSetupDialog(PrivilegedSession *session, QWidget *parent
     configureOplCheck->setChecked(true);
     configureOplCheck->setToolTip("Writes conf_opl.cfg directly so the first OPL boot is already configured for an internal-HDD build. A direct HDD/PFS IGR exit path is deliberately not forced because stock OPL's IGR loader does not initialize HDD/PFS before loading an exit ELF.");
 
-    auto *appsLabel = new QLabel("Additional preconfigured OPL Apps", provision);
+    appsStorageSize = new QComboBox(provision);
+    appsStorageSize->addItem("512 MiB", 512);
+    appsStorageSize->addItem("1 GiB", 1024);
+    appsStorageSize->addItem("2 GiB", 2048);
+    appsStorageSize->addItem("4 GiB (recommended)", 4096);
+    appsStorageSize->addItem("8 GiB", 8192);
+    appsStorageSize->addItem("16 GiB", 16384);
+    appsStorageSize->addItem("32 GiB", 32768);
+    appsStorageSize->setCurrentIndex(
+            appsStorageSize->findData(4096));
+    appsStorageSize->setToolTip(
+            "Bank-0 PFS space shared by OPL, Apps, ART, CFG, ROMS and emulator saves.");
+
+    auto *appsLabel =
+            new QLabel(
+                "Additional preconfigured OPL Apps",
+                provision);
     appsLabel->setStyleSheet("font-weight: 600;");
     installWleCheck = new QCheckBox("wLaunchELF_ISR - latest normal BOOT.ELF", provision);
     installWleCheck->setChecked(true);
-    installMcaCheck = new QCheckBox("Memory Card Annihilator - latest automated build", provision);
+    installMcaCheck =
+            new QCheckBox(
+                "Memory Card Annihilator - latest automated build",
+                provision);
     installMcaCheck->setChecked(true);
+
+    installFceummCheck =
+            new QCheckBox(
+                "FCEUmm-PS2 SMB - NES emulator + HDD/SMB ROM browser",
+                provision);
+    installFceummCheck->setChecked(true);
+    installFceummCheck->setToolTip(
+            "Installs the pinned tested FCEUmm-PS2 SMB release, creates /OPL/ROMS/NES and /OPL/SAVES/FCEUMM, and preconfigures HDD paths.");
     installEnablerCheck = new QCheckBox("FHDB HDD Boot Configuration - Status / Enable / Disable / Verify", provision);
     installEnablerCheck->setChecked(true);
 
@@ -97,9 +124,13 @@ Ps2HddSetupDialog::Ps2HddSetupDialog(PrivilegedSession *session, QWidget *parent
 
     provisionLayout->addRow(QString(), installOplCheck);
     provisionLayout->addRow(QString(), configureOplCheck);
+    provisionLayout->addRow(
+            "Apps / ART / ROMS reserve:",
+            appsStorageSize);
     provisionLayout->addRow(QString(), appsLabel);
     provisionLayout->addRow(QString(), installWleCheck);
     provisionLayout->addRow(QString(), installMcaCheck);
+    provisionLayout->addRow(QString(), installFceummCheck);
     provisionLayout->addRow(QString(), installEnablerCheck);
     provisionLayout->addRow(QString(), installFhdbCheck);
     provisionLayout->addRow(QString(), createFreeDvdBootCheck);
@@ -203,7 +234,10 @@ Ps2::ProvisioningSelection Ps2HddSetupDialog::provisioningSelection() const
     selection.installOpl = installOplCheck->isChecked();
     selection.configureOplPlugAndPlay = configureOplCheck->isChecked();
     selection.installWlaunchElf = installWleCheck->isChecked();
-    selection.installMemoryCardAnnihilator = installMcaCheck->isChecked();
+    selection.installMemoryCardAnnihilator =
+            installMcaCheck->isChecked();
+    selection.installFceumm =
+            installFceummCheck->isChecked();
     selection.installFhdb = installFhdbCheck->isChecked();
     selection.installHddBootEnabler = installEnablerCheck->isChecked();
     return selection;
@@ -215,7 +249,10 @@ QString Ps2HddSetupDialog::provisioningSummary() const
     if (installOplCheck->isChecked()) selected << "latest OPL Beta";
     if (configureOplCheck->isChecked()) selected << "plug-and-play OPL configuration";
     if (installWleCheck->isChecked()) selected << "wLaunchELF_ISR";
-    if (installMcaCheck->isChecked()) selected << "Memory Card Annihilator";
+    if (installMcaCheck->isChecked())
+        selected << "Memory Card Annihilator";
+    if (installFceummCheck->isChecked())
+        selected << "FCEUmm-PS2 SMB + ROMS/NES";
     if (installEnablerCheck->isChecked()) selected << "FHDB HDD Boot Configuration";
     if (installFhdbCheck->isChecked()) selected << "FreeHDBoot 1.966";
     if (createFreeDvdBootCheck->isChecked())
@@ -449,6 +486,17 @@ void Ps2HddSetupDialog::formatSelectedDisk()
             .arg(device).arg(QString::fromStdString(candidate.disk.model))
             .arg(formatBytes(candidate.disk.size)).arg(QString::number(candidate.disk.size))
             .arg(layoutDescription).arg(provisioningSummary());
+
+    warning +=
+            QString(
+                "\n\nOPL / Apps / ART / ROMS PFS reserve: %1 MiB (%2 GiB).")
+                .arg(appsStorageSize->currentData().toUInt())
+                .arg(
+                    appsStorageSize->currentData().toDouble() /
+                            1024.0,
+                    0,
+                    'f',
+                    1);
     if (provision.installFhdb)
         warning += "\n\nFHDB WARNING: the HDD files/bootstrap will be installed, but the console EEPROM HDD-boot setting must still be enabled once. Use the included Status / Enable / Disable / Verify utility from OPL/FMCB.";
     if (createFreeDvdBootCheck->isChecked())
@@ -471,7 +519,10 @@ void Ps2HddSetupDialog::formatSelectedDisk()
     QStringList fetchArguments;
     if (provision.installOpl && !extended) fetchArguments << "--opl";
     if (provision.installWlaunchElf) fetchArguments << "--wle";
-    if (provision.installMemoryCardAnnihilator) fetchArguments << "--mca";
+    if (provision.installMemoryCardAnnihilator)
+        fetchArguments << "--mca";
+    if (provision.installFceumm)
+        fetchArguments << "--fceumm";
     if (provision.installFhdb) fetchArguments << "--fhdb";
     if (provision.installHddBootEnabler) fetchArguments << "--hdd-enabler";
     if (createFreeDvdBootCheck->isChecked()) fetchArguments << "--freedvdboot";
@@ -509,14 +560,20 @@ void Ps2HddSetupDialog::formatSelectedDisk()
     QStringList arguments;
     arguments << "--device" << device
               << "--expected-size" << QString::number(candidate.disk.size)
-              << "--pfsshell" << pfsshellPath;
+              << "--pfsshell" << pfsshellPath
+              << "--apps-size-mib"
+              << QString::number(
+                    appsStorageSize->currentData().toUInt());
     if (extended) arguments << "--extended-banks";
     if (provision.any()) {
         arguments << "--payload-dir" << payloadPath;
         if (provision.installOpl) arguments << "--install-opl";
         if (provision.configureOplPlugAndPlay) arguments << "--configure-opl";
         if (provision.installWlaunchElf) arguments << "--install-wle";
-        if (provision.installMemoryCardAnnihilator) arguments << "--install-mca";
+        if (provision.installMemoryCardAnnihilator)
+            arguments << "--install-mca";
+        if (provision.installFceumm)
+            arguments << "--install-fceumm";
         if (provision.installFhdb) arguments << "--install-fhdb";
         if (provision.installHddBootEnabler) arguments << "--install-hdd-enabler";
     }

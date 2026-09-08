@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 #include <utility>
+#include <unordered_set>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -242,11 +243,27 @@ std::vector<ApaPartitionProbe> Apa::ReadPartitionChain(const std::string &device
 {
     if (bankSectorCount < HeaderSize / HddLayoutPlanner::SectorSize)
         throw std::invalid_argument("APA bank is too small to contain an MBR header.");
-    if (maximumPartitions == 0)
-        throw std::invalid_argument("APA partition-chain limit must be non-zero.");
+
+    const std::uint64_t chunkDerived =
+            bankSectorCount / AllocationChunkSectors + 16ULL;
+
+    // 65536 avoids ever treating a dense but legitimate 2 TiB APA bank as
+    // corrupt merely because it contains many game/subpartition headers.
+    const std::uint64_t automaticLimit64 =
+            std::max<std::uint64_t>(65536ULL, chunkDerived);
+
+    const std::uint32_t safetyLimit = maximumPartitions == 0
+            ? static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>(
+                        automaticLimit64,
+                        std::numeric_limits<std::uint32_t>::max()))
+            : maximumPartitions;
 
     std::vector<ApaPartitionProbe> result;
-    std::vector<std::uint32_t> visited;
+    result.reserve(std::min<std::uint32_t>(safetyLimit, 4096U));
+
+    std::unordered_set<std::uint32_t> visited;
+    visited.reserve(std::min<std::uint32_t>(safetyLimit, 65536U));
 
 #ifdef _WIN32
     const std::wstring widePath(devicePath.begin(), devicePath.end());
@@ -254,47 +271,83 @@ std::vector<ApaPartitionProbe> Apa::ReadPartitionChain(const std::string &device
             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE)
-        throw std::runtime_error(windowsError("Opening the physical disk for APA chain inspection"));
+        throw std::runtime_error(windowsError(
+                "Opening the physical disk for APA chain inspection"));
 
     auto readHeader = [&](std::uint64_t physicalSector) {
-        const std::uint64_t byteOffset = physicalSector * HddLayoutPlanner::SectorSize;
-        if (byteOffset > static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max()))
-            throw std::runtime_error("APA chain offset exceeds the host file API range.");
+        const std::uint64_t byteOffset =
+                physicalSector * HddLayoutPlanner::SectorSize;
+        if (byteOffset >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<LONGLONG>::max()))
+            throw std::runtime_error(
+                    "APA chain offset exceeds the host file API range.");
+
         LARGE_INTEGER position;
         position.QuadPart = static_cast<LONGLONG>(byteOffset);
         if (!SetFilePointerEx(handle, position, nullptr, FILE_BEGIN))
-            throw std::runtime_error(windowsError("Seeking to an APA partition header"));
+            throw std::runtime_error(
+                    windowsError("Seeking to an APA partition header"));
+
         std::array<unsigned char, HeaderSize> header = {};
         DWORD bytesRead = 0;
-        if (!ReadFile(handle, header.data(), static_cast<DWORD>(header.size()), &bytesRead, nullptr) ||
+        if (!ReadFile(handle, header.data(),
+                    static_cast<DWORD>(header.size()),
+                    &bytesRead, nullptr) ||
                 bytesRead != header.size())
-            throw std::runtime_error(windowsError("Reading an APA partition header"));
+            throw std::runtime_error(
+                    windowsError("Reading an APA partition header"));
+
         return header;
     };
 
     try
     {
         std::uint32_t relativeSector = 0;
-        for (std::uint32_t entry = 0; entry < maximumPartitions; entry++)
+        for (std::uint32_t entry = 0; entry < safetyLimit; entry++)
         {
             if (relativeSector >= bankSectorCount)
-                throw std::runtime_error("APA partition chain points outside the selected bank.");
-            if (std::find(visited.begin(), visited.end(), relativeSector) != visited.end())
-                throw std::runtime_error("APA partition chain contains a loop.");
-            visited.push_back(relativeSector);
+                throw std::runtime_error(
+                        "APA partition chain points outside the selected bank.");
 
-            const std::uint64_t physicalSector = bankBaseSector + relativeSector;
+            if (!visited.insert(relativeSector).second)
+                throw std::runtime_error(
+                        "APA partition chain contains a loop.");
+
+            const std::uint64_t physicalSector =
+                    bankBaseSector + relativeSector;
             const auto raw = readHeader(physicalSector);
-            const ApaHeaderInfo parsed = ParseHeader(raw.data(), raw.size(), entry == 0);
-            if (parsed.state != ApaHeaderState::Valid)
-                throw std::runtime_error("Invalid APA partition header at bank-relative sector " +
-                        std::to_string(relativeSector) + ": " + parsed.message);
-            if (parsed.start != relativeSector)
-                throw std::runtime_error("APA partition header start field does not match its location.");
+            const ApaHeaderInfo parsed =
+                    ParseHeader(raw.data(), raw.size(), entry == 0);
 
-            result.push_back({ relativeSector, physicalSector, parsed });
+            if (parsed.state != ApaHeaderState::Valid)
+                throw std::runtime_error(
+                        "Invalid APA partition header at bank-relative sector " +
+                        std::to_string(relativeSector) + ": " +
+                        parsed.message);
+
+            if (parsed.start != relativeSector)
+                throw std::runtime_error(
+                        "APA partition header start field does not match its location.");
+
+            if (parsed.length == 0 ||
+                    static_cast<std::uint64_t>(parsed.start) +
+                            parsed.length > bankSectorCount)
+                throw std::runtime_error(
+                        "APA partition extends outside the selected bank.");
+
+            result.push_back({
+                    relativeSector,
+                    physicalSector,
+                    parsed
+            });
+
             if (parsed.next == 0)
+            {
+                CloseHandle(handle);
                 return result;
+            }
+
             relativeSector = parsed.next;
         }
     }
@@ -303,56 +356,105 @@ std::vector<ApaPartitionProbe> Apa::ReadPartitionChain(const std::string &device
         CloseHandle(handle);
         throw;
     }
+
     CloseHandle(handle);
+
 #elif defined(__linux__)
-    const int descriptor = open(devicePath.c_str(), O_RDONLY | O_CLOEXEC);
+    const int descriptor =
+            open(devicePath.c_str(), O_RDONLY | O_CLOEXEC);
     if (descriptor < 0)
-        throw std::runtime_error(linuxError("Opening the physical disk for APA chain inspection",
-                devicePath));
+        throw std::runtime_error(
+                linuxError(
+                    "Opening the physical disk for APA chain inspection",
+                    devicePath));
 
     auto readHeader = [&](std::uint64_t physicalSector) {
-        const std::uint64_t byteOffset = physicalSector * HddLayoutPlanner::SectorSize;
-        if (byteOffset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()))
-            throw std::runtime_error("APA chain offset exceeds the host file API range.");
+        const std::uint64_t byteOffset =
+                physicalSector * HddLayoutPlanner::SectorSize;
+
+        if (byteOffset >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<off_t>::max()))
+            throw std::runtime_error(
+                    "APA chain offset exceeds the host file API range.");
+
         std::array<unsigned char, HeaderSize> header = {};
         std::size_t completed = 0;
+
         while (completed < header.size())
         {
-            const ssize_t received = pread(descriptor, header.data() + completed,
-                    header.size() - completed,
-                    static_cast<off_t>(byteOffset + completed));
+            const ssize_t received =
+                    pread(
+                        descriptor,
+                        header.data() + completed,
+                        header.size() - completed,
+                        static_cast<off_t>(
+                            byteOffset + completed));
+
             if (received < 0)
-                throw std::runtime_error(linuxError("Reading an APA partition header", devicePath));
+                throw std::runtime_error(
+                        linuxError(
+                            "Reading an APA partition header",
+                            devicePath));
+
             if (received == 0)
-                throw std::runtime_error("The physical disk returned an incomplete APA partition header.");
+                throw std::runtime_error(
+                        "The physical disk returned an incomplete APA partition header.");
+
             completed += static_cast<std::size_t>(received);
         }
+
         return header;
     };
 
     try
     {
         std::uint32_t relativeSector = 0;
-        for (std::uint32_t entry = 0; entry < maximumPartitions; entry++)
+
+        for (std::uint32_t entry = 0; entry < safetyLimit; entry++)
         {
             if (relativeSector >= bankSectorCount)
-                throw std::runtime_error("APA partition chain points outside the selected bank.");
-            if (std::find(visited.begin(), visited.end(), relativeSector) != visited.end())
-                throw std::runtime_error("APA partition chain contains a loop.");
-            visited.push_back(relativeSector);
+                throw std::runtime_error(
+                        "APA partition chain points outside the selected bank.");
 
-            const std::uint64_t physicalSector = bankBaseSector + relativeSector;
+            if (!visited.insert(relativeSector).second)
+                throw std::runtime_error(
+                        "APA partition chain contains a loop.");
+
+            const std::uint64_t physicalSector =
+                    bankBaseSector + relativeSector;
             const auto raw = readHeader(physicalSector);
-            const ApaHeaderInfo parsed = ParseHeader(raw.data(), raw.size(), entry == 0);
-            if (parsed.state != ApaHeaderState::Valid)
-                throw std::runtime_error("Invalid APA partition header at bank-relative sector " +
-                        std::to_string(relativeSector) + ": " + parsed.message);
-            if (parsed.start != relativeSector)
-                throw std::runtime_error("APA partition header start field does not match its location.");
+            const ApaHeaderInfo parsed =
+                    ParseHeader(raw.data(), raw.size(), entry == 0);
 
-            result.push_back({ relativeSector, physicalSector, parsed });
+            if (parsed.state != ApaHeaderState::Valid)
+                throw std::runtime_error(
+                        "Invalid APA partition header at bank-relative sector " +
+                        std::to_string(relativeSector) + ": " +
+                        parsed.message);
+
+            if (parsed.start != relativeSector)
+                throw std::runtime_error(
+                        "APA partition header start field does not match its location.");
+
+            if (parsed.length == 0 ||
+                    static_cast<std::uint64_t>(parsed.start) +
+                            parsed.length > bankSectorCount)
+                throw std::runtime_error(
+                        "APA partition extends outside the selected bank.");
+
+            result.push_back({
+                    relativeSector,
+                    physicalSector,
+                    parsed
+            });
+
             if (parsed.next == 0)
+            {
+                close(descriptor);
                 return result;
+            }
+
             relativeSector = parsed.next;
         }
     }
@@ -361,18 +463,280 @@ std::vector<ApaPartitionProbe> Apa::ReadPartitionChain(const std::string &device
         close(descriptor);
         throw;
     }
+
     close(descriptor);
+
 #else
     (void)devicePath;
     (void)bankBaseSector;
     (void)bankSectorCount;
-    (void)maximumPartitions;
 #endif
 
-    if (result.size() == maximumPartitions)
-        throw std::runtime_error("APA partition chain exceeded the configured safety limit.");
-    return result;
+    throw std::runtime_error(
+            "APA partition chain exceeded its large geometry-aware corruption guard (" +
+            std::to_string(safetyLimit) +
+            " headers).");
 }
 
+namespace
+{
+
+std::vector<unsigned char> buildApaChunkMap(
+        const std::vector<Ps2::ApaPartitionProbe> &chain,
+        std::uint64_t bankSectorCount)
+{
+    const std::uint64_t total64 =
+            bankSectorCount / Ps2::Apa::AllocationChunkSectors;
+
+    if (total64 >
+            std::numeric_limits<std::uint32_t>::max())
+        throw std::runtime_error(
+                "APA chunk map exceeds host accounting range.");
+
+    std::vector<unsigned char> used(
+            static_cast<std::size_t>(total64), 0);
+
+    for (const auto &probe : chain)
+    {
+        const auto &h = probe.header;
+
+        if ((h.start % Ps2::Apa::AllocationChunkSectors) != 0 ||
+                (h.length % Ps2::Apa::AllocationChunkSectors) != 0)
+            throw std::runtime_error(
+                    "APA partition is not aligned to the 128 MiB allocation grid.");
+
+        const std::uint64_t first =
+                h.start / Ps2::Apa::AllocationChunkSectors;
+        const std::uint64_t count =
+                h.length / Ps2::Apa::AllocationChunkSectors;
+
+        if (count == 0 ||
+                first + count > used.size())
+            throw std::runtime_error(
+                    "APA partition has an invalid allocation-chunk range.");
+
+        for (std::uint64_t i = 0; i < count; ++i)
+        {
+            const std::size_t index =
+                    static_cast<std::size_t>(first + i);
+
+            if (used[index])
+                throw std::runtime_error(
+                        "APA allocation map contains overlapping partitions.");
+
+            used[index] = 1;
+        }
+    }
+
+    return used;
+}
+
+Ps2::ApaBankSpaceInfo summarizeChunks(
+        const std::vector<unsigned char> &used)
+{
+    Ps2::ApaBankSpaceInfo info;
+    info.totalChunks =
+            static_cast<std::uint32_t>(used.size());
+
+    std::uint32_t run = 0;
+
+    for (unsigned char value : used)
+    {
+        if (value)
+        {
+            ++info.usedChunks;
+            run = 0;
+        }
+        else
+        {
+            ++info.freeChunks;
+            ++run;
+            info.largestFreeRun =
+                    std::max(info.largestFreeRun, run);
+        }
+    }
+
+    return info;
+}
+
+std::uint32_t partitionRunsForFirstFreeChunks(
+        const std::vector<unsigned char> &used,
+        std::uint32_t needed,
+        std::uint32_t maxPartEntries)
+{
+    if (needed == 0)
+        return 0;
+
+    std::uint32_t selected = 0;
+    std::uint32_t runs = 0;
+    std::uint32_t runEntries = 0;
+    std::uint32_t previous =
+            std::numeric_limits<std::uint32_t>::max();
+
+    for (std::uint32_t index = 0;
+            index < used.size() && selected < needed;
+            ++index)
+    {
+        if (used[index])
+            continue;
+
+        if (runs == 0 ||
+                index != previous + 1U ||
+                runEntries >= maxPartEntries)
+        {
+            ++runs;
+            runEntries = 1;
+        }
+        else
+        {
+            ++runEntries;
+        }
+
+        previous = index;
+        ++selected;
+    }
+
+    if (selected != needed)
+        return std::numeric_limits<std::uint32_t>::max();
+
+    return runs;
+}
+
+} // namespace
+
+ApaBankSpaceInfo Apa::MeasureBankSpace(
+        const std::string &devicePath,
+        std::uint64_t bankBaseSector,
+        std::uint64_t bankSectorCount)
+{
+    const auto chain =
+            ReadPartitionChain(
+                devicePath,
+                bankBaseSector,
+                bankSectorCount,
+                0);
+
+    return summarizeChunks(
+            buildApaChunkMap(
+                chain,
+                bankSectorCount));
+}
+
+ApaHdlAllocationEstimate Apa::EstimateHdlAllocation(
+        const std::string &devicePath,
+        std::uint64_t bankBaseSector,
+        std::uint64_t bankSectorCount,
+        std::uint64_t imageBytes)
+{
+    ApaHdlAllocationEstimate estimate;
+
+    const auto chain =
+            ReadPartitionChain(
+                devicePath,
+                bankBaseSector,
+                bankSectorCount,
+                0);
+
+    const std::vector<unsigned char> used =
+            buildApaChunkMap(
+                chain,
+                bankSectorCount);
+
+    const ApaBankSpaceInfo space =
+            summarizeChunks(used);
+
+    estimate.totalChunks = space.totalChunks;
+    estimate.usedChunks = space.usedChunks;
+    estimate.freeChunks = space.freeChunks;
+    estimate.largestFreeRun = space.largestFreeRun;
+
+    if (imageBytes == 0 || used.empty())
+        return estimate;
+
+    constexpr std::uint64_t MiB =
+            1024ULL * 1024ULL;
+
+    const std::uint64_t imageMiB =
+            (imageBytes + MiB - 1ULL) / MiB;
+
+    std::uint32_t requiredChunks =
+            static_cast<std::uint32_t>(
+                (imageMiB + 127ULL) / 128ULL);
+
+    if (requiredChunks == 0)
+        requiredChunks = 1;
+
+    const std::uint32_t maxPartEntries =
+            space.totalChunks < 32U
+                ? 1U
+                : std::max<std::uint32_t>(
+                    1U,
+                    space.totalChunks / 32U);
+
+    // The HDL allocator may need one additional 128 MiB chunk for its
+    // 4 MiB main + 1 MiB-per-subpartition metadata overhead. Iterate
+    // until the estimate is stable.
+    for (int pass = 0; pass < 3; ++pass)
+    {
+        if (requiredChunks > space.freeChunks)
+        {
+            estimate.requiredChunks =
+                    requiredChunks;
+            return estimate;
+        }
+
+        const std::uint32_t runs =
+                partitionRunsForFirstFreeChunks(
+                    used,
+                    requiredChunks,
+                    maxPartEntries);
+
+        if (runs ==
+                std::numeric_limits<std::uint32_t>::max())
+        {
+            estimate.requiredChunks =
+                    requiredChunks;
+            return estimate;
+        }
+
+        estimate.partitionRuns = runs;
+
+        // 1 main + max 64 subpartitions.
+        if (runs > 65U)
+        {
+            estimate.requiredChunks =
+                    requiredChunks;
+            return estimate;
+        }
+
+        const std::uint64_t overheadMiB =
+                3ULL +
+                static_cast<std::uint64_t>(runs);
+
+        const std::uint64_t requiredMiB =
+                imageMiB + overheadMiB;
+
+        const std::uint32_t withOverhead =
+                static_cast<std::uint32_t>(
+                    (requiredMiB + 127ULL) / 128ULL);
+
+        if (withOverhead <= requiredChunks)
+        {
+            estimate.requiredChunks =
+                    requiredChunks;
+            estimate.fits = true;
+            return estimate;
+        }
+
+        requiredChunks = withOverhead;
+    }
+
+    estimate.requiredChunks = requiredChunks;
+    estimate.fits =
+            requiredChunks <= space.freeChunks &&
+            estimate.partitionRuns <= 65U;
+
+    return estimate;
+}
 
 } // namespace Ps2

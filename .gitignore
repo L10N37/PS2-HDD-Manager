@@ -29,3 +29,19 @@ payload/runtime/
 .total-velocity-marking-v4-backup-*/
 .live-queue-v5-backup-*/
 .mixed-bank-queue-v6-backup-*/
+
+# Local hardware-test / release artifacts.
+/.hdl-inject-v4-backup-*/
+/.hdd-read-crash-v5-backup-*/
+/.responsive-live-queue-v6-backup-*/
+/.responsive-live-queue-v6b-backup-*/
+/.crash-tracing-v7-backup-*/
+/.confirmed-right-pane-v8-backup-*/
+/.pfs-progress-v10-backup-*/
+/src/ui/MainWindow.cpp.pre-*
+/src/ui/MainWindow.h.pre-*
+/src/formatter_main.cpp.pre-*
+/ps2-hdd-manager-debug-*.log
+/ps2-hdd-manager-debug-*.txt
+/ps2-hdd-manager-debug-*.tar.gz
+/dist/

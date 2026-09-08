@@ -5,11 +5,11 @@ project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 payload_root="$project_root/payload/runtime"
 cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/ps2-hdd-manager"
 download_cache="$cache_root/downloads"
-want_opl=0 want_opl_extended=0 want_wle=0 want_fhdb=0 want_enabler=0 want_mca=0 want_freedvdboot=0
+want_opl=0 want_opl_extended=0 want_wle=0 want_fhdb=0 want_enabler=0 want_mca=0 want_fceumm=0 want_freedvdboot=0
 
 usage() {
     cat <<'USAGE'
-Usage: ./fetch_payloads.sh [--opl] [--wle] [--mca] [--fhdb] [--hdd-enabler] [--freedvdboot] [--all]
+Usage: ./fetch_payloads.sh [--opl] [--wle] [--mca] [--fceumm] [--fhdb] [--hdd-enabler] [--freedvdboot] [--all]
 
 Downloads only selected optional payloads. Downloads/toolchains are persisted under
 ~/.cache/ps2-hdd-manager so subsequent PS2 HDD Manager builds reuse them.
@@ -18,6 +18,7 @@ Downloads only selected optional payloads. Downloads/toolchains are persisted un
   --opl-extended-apa  Hardware-tested Extended APA ELF for >2 TiB banked HDDs
   --wle            Latest normal wLaunchELF_ISR BOOT.ELF (tag: latest)
   --mca            Latest Memory Card Annihilator packed ELF
+  --fceumm         FCEUmm-PS2 SMB v0.3.4-smb1 (pinned tested release)
   --fhdb           Pinned FreeHDBoot 1.966 HDD payload
   --hdd-enabler    Build the dedicated FHDB HDD Boot Configuration ELF
   --freedvdboot    CTurt FreeDVDBoot source profiles used by ISO creator
@@ -32,10 +33,11 @@ for arg in "$@"; do
         --opl-extended-apa) want_opl_extended=1 ;;
         --wle) want_wle=1 ;;
         --mca) want_mca=1 ;;
+        --fceumm) want_fceumm=1 ;;
         --fhdb) want_fhdb=1 ;;
         --hdd-enabler) want_enabler=1 ;;
         --freedvdboot) want_freedvdboot=1; want_enabler=1 ;;
-        --all) want_opl=1; want_wle=1; want_mca=1; want_fhdb=1; want_enabler=1; want_freedvdboot=1 ;;
+        --all) want_opl=1; want_wle=1; want_mca=1; want_fceumm=1; want_fhdb=1; want_enabler=1; want_freedvdboot=1 ;;
         --help|-h) usage; exit 0 ;;
         *) echo "Unknown argument: $arg" >&2; usage >&2; exit 2 ;;
     esac
@@ -179,6 +181,36 @@ PYZIP
     require_elf "$payload_root/mca/BOOT.ELF"
     printf '%s\n' "Memory Card Annihilator selected ELF | sha256=$(sha256sum "$payload_root/mca/BOOT.ELF" | awk '{print $1}')" >> "$manifest"
     rm -rf "$tmpdir"; trap - EXIT
+fi
+
+
+if (( want_fceumm )); then
+    echo "==> FCEUmm-PS2 SMB v0.3.4-smb1"
+    mkdir -p "$payload_root/fceumm"
+
+    fce_repo="L10N37/Fceumm-PS2-SMB"
+    fce_tag="v0.3.4-smb1"
+    fce_asset="FCEUmm-PS2-SMB-v0.3.4-smb1.elf"
+    fce_sha="b6efeb96a073dfd303e286d9a81a009393737addd03ae54b8e6f2ffc34c78535"
+
+    cached_release_asset \
+        "$fce_repo" \
+        "$fce_tag" \
+        "$fce_asset" \
+        exact \
+        "$payload_root/fceumm/BOOT.ELF"
+
+    require_elf "$payload_root/fceumm/BOOT.ELF"
+
+    actual_sha="$(sha256sum "$payload_root/fceumm/BOOT.ELF" | awk '{print $1}')"
+    if [[ "$actual_sha" != "$fce_sha" ]]; then
+        echo "FCEUmm-PS2 SMB checksum mismatch." >&2
+        echo "Expected: $fce_sha" >&2
+        echo "Actual:   $actual_sha" >&2
+        exit 1
+    fi
+
+    echo "    verified FCEUmm ELF: sha256:$actual_sha"
 fi
 
 if (( want_fhdb )); then

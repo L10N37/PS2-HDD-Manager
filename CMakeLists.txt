@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(PS2HDDManager VERSION 0.1.0 LANGUAGES CXX)
+project(PS2HDDManager VERSION 0.1.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -72,6 +72,12 @@ if(PS2_HDD_BUILD_GUI)
         endif()
         qt_add_executable(ps2-hdd-manager WIN32 ${PS2_HDD_GUI_SOURCES})
         target_link_libraries(ps2-hdd-manager PRIVATE ps2hddcore Qt6::Widgets Qt6::Network)
+        if(UNIX AND NOT APPLE)
+            # PS2_HDD_CRASH_TRACE_SYMBOLS: preserve useful native stack names
+            # for the alpha hardware-test builds.
+            target_compile_options(ps2-hdd-manager PRIVATE -fno-omit-frame-pointer)
+            target_link_options(ps2-hdd-manager PRIVATE -rdynamic)
+        endif()
         target_compile_definitions(ps2-hdd-manager PRIVATE
             PS2_HDD_APP_VERSION="${PROJECT_VERSION}-alpha"
             PS2_HDD_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")

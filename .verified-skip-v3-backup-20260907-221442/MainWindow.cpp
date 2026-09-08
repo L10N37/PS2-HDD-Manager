@@ -1,5 +1,4 @@
 #include "MainWindow.h"
-#include "DebugTrace.h"
 
 #include "FhdbConfigDialog.h"
 #include "Ps2HddSetupDialog.h"
@@ -44,12 +43,10 @@
 #include <QPainter>
 #include <QProgressBar>
 #include <QProgressDialog>
-#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSettings>
 #include <QSaveFile>
-#include <QScopedValueRollback>
 #include <QSet>
 #include <QSplitter>
 #include <QStatusBar>
@@ -61,7 +58,6 @@
 #include <QTemporaryFile>
 #include <QTimer>
 #include <QTextStream>
-#include <QTextCursor>
 #include <QTreeView>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
@@ -162,7 +158,6 @@ private:
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 {
-    PS2_TRACE_SCOPE("MainWindow::MainWindow");
 #ifdef __linux__
     const QString root = QString::fromLocal8Bit(PS2_HDD_PROJECT_ROOT);
     writerPath = QCoreApplication::applicationDirPath() + "/PS2-HDD-Writer";
@@ -339,11 +334,6 @@ void MainWindow::buildUi()
     connect(privilegedSession, &PrivilegedSession::unlockedChanged, this, [this](bool) { updateUnlockUi(); });
     connect(refresh, &QPushButton::clicked, this, &MainWindow::refreshDisks);
     connect(setup, &QPushButton::clicked, this, [this]() {
-        if (transferQueueRunning) {
-            statusBar()->showMessage(
-                    "PS2 HDD Setup is disabled while the game queue is running.");
-            return;
-        }
         if (!unlockHddSession(true)) return;
         Ps2HddSetupDialog dialog(privilegedSession, this);
         dialog.exec();
@@ -557,36 +547,17 @@ QWidget *MainWindow::buildPs2Pane()
     layout->addWidget(ps2View, 1);
 
     connect(refresh, &QPushButton::clicked, this, [this]() {
-        if (transferQueueRunning) {
-            statusBar()->showMessage(
-                    "Refresh HDD is disabled while the game queue is running.");
-            return;
-        }
-        if (unlockHddSession(true))
-            refreshCurrentPs2Tree();
+        if (unlockHddSession(true)) refreshCurrentPs2Tree();
     });
     connect(addArtButton, &QPushButton::clicked, this, &MainWindow::addArtwork);
     connect(installAppsButton, &QPushButton::clicked, this, &MainWindow::installOrUpdateOplApps);
     connect(applyOplDefaultsButton, &QPushButton::clicked, this, &MainWindow::applyRecommendedOplDefaults);
     connect(ps2View, &QTreeWidget::itemExpanded, this, [this](QTreeWidgetItem *item) {
-        if (!item || item->data(0, KindRole).toInt() != NodePfsDirectory ||
-                item->data(0, LoadedRole).toBool())
+        if (!item || item->data(0, KindRole).toInt() != NodePfsDirectory || item->data(0, LoadedRole).toBool())
             return;
-
-        // Do not nest PFS reads inside another raw-HDD operation/tree rebuild.
-        // The item remains unloaded and can be expanded again after the current
-        // operation completes.
-        if (transferQueueRunning || hddOperationInProgress || ps2RefreshInProgress)
-            return;
-
         const int index = diskCombo ? diskCombo->currentIndex() : -1;
-        if (index >= 0 && static_cast<std::size_t>(index) < disks.size()) {
-            const auto disk = disks[static_cast<std::size_t>(index)];
-            populatePfsDirectory(
-                    item,
-                    item->data(0, PathRole).toString(),
-                    disk);
-        }
+        if (index >= 0 && static_cast<std::size_t>(index) < disks.size())
+            populatePfsDirectory(item, item->data(0, PathRole).toString(), disks[static_cast<std::size_t>(index)]);
     });
     return group;
 }
@@ -640,30 +611,6 @@ void MainWindow::navigatePc(const QString &path)
 
 void MainWindow::refreshDisks()
 {
-    PS2_TRACE_SCOPE("MainWindow::refreshDisks");
-    DebugTrace::write(
-            "refreshDisks: transferQueueRunning=" +
-            std::to_string(transferQueueRunning) +
-            " hddOperationInProgress=" +
-            std::to_string(hddOperationInProgress) +
-            " ps2RefreshInProgress=" +
-            std::to_string(ps2RefreshInProgress));
-    if (transferQueueRunning) {
-        statusBar()->showMessage(
-                "Disk rescan is disabled while the game queue is running. "
-                "PC browsing and queue additions remain available.");
-        return;
-    }
-
-    if (hddOperationInProgress || ps2RefreshInProgress) {
-        diskRescanPending = true;
-        DebugTrace::write(
-                "refreshDisks: DEFERRED because a right-pane/HDD read is active");
-        statusBar()->showMessage(
-                "Disk rescan queued until the current PS2 HDD read finishes.");
-        return;
-    }
-
     QString previous;
     const int oldIndex = diskCombo ? diskCombo->currentIndex() : -1;
     if (oldIndex >= 0 && static_cast<std::size_t>(oldIndex) < disks.size())
@@ -672,7 +619,6 @@ void MainWindow::refreshDisks()
     diskCombo->blockSignals(true);
     diskCombo->clear();
     disks.clear();
-    ++ps2TreeGeneration;
     ps2View->clear();
     currentOplPartition.clear();
     currentOplBase.clear();
@@ -688,20 +634,13 @@ void MainWindow::refreshDisks()
                     .arg(formatBytes(disk.size)));
             if (QString::fromStdString(disk.devicePath) == previous) restore = static_cast<int>(i);
         }
-        if (disks.empty())
-            statusLabel->setText("No supported physical disks were found.");
+        if (disks.empty()) statusLabel->setText("No supported physical disks were found.");
         statusBar()->showMessage("Disk scan complete. No disk was modified.");
-
-        // Keep signals blocked while restoring the index. We explicitly call
-        // selectDisk once below; otherwise currentIndexChanged plus the manual
-        // call performs two complete HDD reads back-to-back.
-        if (!disks.empty())
-            diskCombo->setCurrentIndex(restore >= 0 ? restore : 0);
-
         diskCombo->blockSignals(false);
-
-        if (!disks.empty())
+        if (!disks.empty()) {
+            diskCombo->setCurrentIndex(restore >= 0 ? restore : 0);
             selectDisk(diskCombo->currentIndex());
+        }
     } catch (const std::exception &e) {
         diskCombo->blockSignals(false);
         statusLabel->setText(QString::fromLocal8Bit(e.what()));
@@ -712,40 +651,13 @@ void MainWindow::refreshDisks()
 
 void MainWindow::selectDisk(int index)
 {
-    PS2_TRACE_SCOPE("MainWindow::selectDisk");
-    DebugTrace::write(
-            "selectDisk: index=" +
-            std::to_string(index) +
-            " disks.size=" +
-            std::to_string(disks.size()) +
-            " transferQueueRunning=" +
-            std::to_string(transferQueueRunning));
-    if (transferQueueRunning) {
-        statusBar()->showMessage(
-                "The target PS2 HDD is locked for this transfer queue.");
-        return;
-    }
-
-    if (hddOperationInProgress || ps2RefreshInProgress) {
-        ps2RefreshPending = true;
-        DebugTrace::write(
-                "selectDisk: DEFERRED because the previous right-pane read is active");
-        statusBar()->showMessage(
-                "Disk selection queued until the current PS2 HDD read finishes.");
-        return;
-    }
-
     resetProgress();
     currentOplPartition.clear();
     currentOplBase.clear();
     if (index < 0 || static_cast<std::size_t>(index) >= disks.size()) {
-        ++ps2TreeGeneration;
-        ps2View->clear();
-        return;
+        ps2View->clear(); return;
     }
-    const auto selectedDisk =
-            disks[static_cast<std::size_t>(index)];
-    populatePs2Tree(selectedDisk);
+    populatePs2Tree(disks[static_cast<std::size_t>(index)]);
     if (gameBankCombo) {
         const int previous = gameBankCombo->currentData().toInt();
         gameBankCombo->clear();
@@ -766,75 +678,13 @@ void MainWindow::selectDisk(int index)
 
 void MainWindow::refreshCurrentPs2Tree()
 {
-    PS2_TRACE_SCOPE("MainWindow::refreshCurrentPs2Tree");
-    DebugTrace::write(
-            "refreshCurrentPs2Tree: comboIndex=" +
-            std::to_string(
-                diskCombo ? diskCombo->currentIndex() : -1) +
-            " disks.size=" +
-            std::to_string(disks.size()) +
-            " transfer=" +
-            std::to_string(transferQueueRunning) +
-            " hddOp=" +
-            std::to_string(hddOperationInProgress) +
-            " refreshInProgress=" +
-            std::to_string(ps2RefreshInProgress) +
-            " refreshPending=" +
-            std::to_string(ps2RefreshPending));
-    // A raw-HDD helper command and populatePs2Tree() are synchronous, but both
-    // intentionally keep the GUI painting. Any refresh event arriving inside
-    // that nested event loop must be deferred rather than recursively clearing
-    // the live tree.
-    if (transferQueueRunning || hddOperationInProgress || ps2RefreshInProgress) {
-        ps2RefreshPending = true;
-        return;
-    }
-
-    const int index =
-            diskCombo ? diskCombo->currentIndex() : -1;
-
-    if (index < 0 ||
-            static_cast<std::size_t>(index) >= disks.size())
-        return;
-
-    const auto selectedDisk =
-            disks[static_cast<std::size_t>(index)];
-
-    populatePs2Tree(selectedDisk);
+    const int index = diskCombo ? diskCombo->currentIndex() : -1;
+    if (index >= 0 && static_cast<std::size_t>(index) < disks.size())
+        populatePs2Tree(disks[static_cast<std::size_t>(index)]);
 }
 
 void MainWindow::populatePs2Tree(const Ps2::PhysicalDiskCandidate &disk)
 {
-    PS2_TRACE_SCOPE("MainWindow::populatePs2Tree");
-    DebugTrace::write(
-            "populatePs2Tree: device=" +
-            disk.devicePath +
-            " size=" +
-            std::to_string(disk.size) +
-            " transfer=" +
-            std::to_string(transferQueueRunning) +
-            " hddOp=" +
-            std::to_string(hddOperationInProgress) +
-            " refreshInProgress=" +
-            std::to_string(ps2RefreshInProgress));
-    if (transferQueueRunning || hddOperationInProgress || ps2RefreshInProgress) {
-        ps2RefreshPending = true;
-        return;
-    }
-
-    QScopedValueRollback<bool> refreshGuard(
-            ps2RefreshInProgress,
-            true);
-
-    // The caller normally already passes a copy, but keep a local copy here as
-    // the final guarantee that no event-driven disk-vector rebuild can dangle
-    // the descriptor used by the game/PFS reads.
-    const Ps2::PhysicalDiskCandidate diskCopy = disk;
-
-    ++ps2TreeGeneration;
-    DebugTrace::write(
-            "populatePs2Tree: tree generation=" +
-            std::to_string(ps2TreeGeneration));
     ps2View->clear();
     currentOplPartition.clear();
     currentOplBase.clear();
@@ -848,34 +698,7 @@ void MainWindow::populatePs2Tree(const Ps2::PhysicalDiskCandidate &disk)
     games->setText(0, "HDL Games");
     games->setText(1, "Real installed game table");
     games->setData(0, KindRole, NodeGamesRoot);
-    // Populated HDD scan in progress. hdl_dump does not expose a reliable
-    // percentage for hdl_toc, so show a busy progress bar rather than
-    // leaving the interface looking frozen on heavily populated disks.
-    // KDE can render Qt's range(0, 0) busy bar as a solid/static fill.
-    // Use a deliberately non-percentage activity sweep instead. The label
-    // never claims this is completion percentage; it only shows that the
-    // long populated-HDD scan is still alive.
-    transferProgress->setRange(0, 100);
-    transferProgress->setValue(0);
-    transferProgress->setFormat("Scanning installed PS2 games: preparing...");
-    transferProgress->setVisible(true);
-    progressDetail->setText(
-            "Scanning installed HDL games... heavily populated disks can take a while.");
-    progressDetail->setVisible(true);
-    statusLabel->setText("Scanning installed PS2 games...");
-    QApplication::processEvents();
-
-    DebugTrace::write("populatePs2Tree: BEGIN populateInstalledGames");
-    populateInstalledGames(games, diskCopy);
-    DebugTrace::write("populatePs2Tree: END populateInstalledGames");
-    // v14b: PFS has no percentage denominator yet; hide the completed HDL bar.
-    transferProgress->setVisible(false);
-    progressDetail->setText(
-            QString("HDL scan complete — %1. Scanning OPL/PFS storage...")
-                    .arg(games->text(3)));
-    transferProgress->setFormat("Scanning OPL/PFS storage...");
-    statusLabel->setText("Scanning OPL/PFS storage...");
-    QApplication::processEvents();
+    populateInstalledGames(games, disk);
 
     auto *opl = new QTreeWidgetItem(root);
     opl->setText(0, "OPL Storage");
@@ -884,168 +707,38 @@ void MainWindow::populatePs2Tree(const Ps2::PhysicalDiskCandidate &disk)
     // @opl asks the privileged backend to map OPL's logical storage root:
     // custom partitions use /OPL, while the canonical +OPL partition uses /.
     opl->setData(0, PathRole, "@opl");
-    DebugTrace::write("populatePs2Tree: BEGIN populatePfsDirectory @opl");
-    populatePfsDirectory(opl, "@opl", diskCopy, false);
-    DebugTrace::write("populatePs2Tree: END populatePfsDirectory @opl");
-
-    transferProgress->setRange(0, 100);
-    transferProgress->setValue(100);
-    transferProgress->setFormat("HDD scan complete");
-    progressDetail->setText(
-            QString("HDD scan complete — %1.")
-                    .arg(games->text(3)));
-    QApplication::processEvents();
-
-    QTimer::singleShot(800, this, [this]() {
-        if (!transferQueueRunning &&
-                !hddOperationInProgress &&
-                !ps2RefreshInProgress) {
-            transferProgress->setVisible(false);
-            progressDetail->setVisible(false);
-        }
-    });
+    populatePfsDirectory(opl, "@opl", disk, false);
 
     root->setExpanded(true);
     games->setExpanded(true);
     opl->setExpanded(true);
-    statusLabel->setText(
-            "Live PS2 HDD view refreshed. Drag ISO(s) to HDL Games or ART/CFG/APPS files and folders to OPL Storage.");
-
-    // Coalesce every request that arrived while this population was alive.
-    // A physical rescan supersedes a simple tree refresh.
-    if (diskRescanPending) {
-        diskRescanPending = false;
-        ps2RefreshPending = false;
-        DebugTrace::write(
-                "populatePs2Tree: scheduling deferred physical disk rescan");
-        QTimer::singleShot(
-                0,
-                this,
-                &MainWindow::refreshDisks);
-    }
-    else if (ps2RefreshPending) {
-        ps2RefreshPending = false;
-        DebugTrace::write(
-                "populatePs2Tree: scheduling deferred right-pane refresh");
-        QTimer::singleShot(
-                0,
-                this,
-                &MainWindow::refreshCurrentPs2Tree);
-    }
+    statusLabel->setText("Live PS2 HDD view refreshed. Drag ISO(s) to HDL Games or ART/CFG/APPS files and folders to OPL Storage.");
 }
 
 bool MainWindow::runPrivilegedWriter(const Ps2::PhysicalDiskCandidate &disk,
-        const QStringList &modeArguments, QString *output, bool parseProgress,
-        const QString &progressPrefix,
-        const std::function<void(const QString &)> &outputCallback)
+        const QStringList &modeArguments, QString *output, bool parseProgress, const QString &progressPrefix)
 {
-    PS2_TRACE_SCOPE("MainWindow::runPrivilegedWriter");
-    DebugTrace::write(
-            "runPrivilegedWriter: device=" +
-            disk.devicePath +
-            " args=[" +
-            modeArguments.join(" ").toStdString() +
-            "] parseProgress=" +
-            std::to_string(parseProgress) +
-            " transfer=" +
-            std::to_string(transferQueueRunning) +
-            " hddOp=" +
-            std::to_string(hddOperationInProgress));
 #ifdef __linux__
     if (!privilegedSession || !privilegedSession->isUnlocked()) {
-        if (output)
-            *output =
-                    "PS2 HDD access is locked. Authenticate once with the Unlock button.";
+        if (output) *output = "PS2 HDD access is locked. Authenticate once with the Unlock button.";
         return false;
     }
-
-    if (hddOperationInProgress) {
-        if (output)
-            *output =
-                    "A PS2 HDD operation is already active. "
-                    "The nested operation was deferred/refused safely.";
-        ps2RefreshPending = true;
-        return false;
-    }
-
-    QScopedValueRollback<bool> operationGuard(
-            hddOperationInProgress,
-            true);
-
     QStringList args;
     args << "--device" << QString::fromStdString(disk.devicePath)
          << "--expected-size" << QString::number(disk.size);
     args << modeArguments;
 
     QString progressWindow;
-    const bool ok =
-            privilegedSession->run(
-                    args,
-                    output,
-                    [this,
-                     parseProgress,
-                     progressPrefix,
-                     outputCallback,
-                     &progressWindow](
-                            const QString &chunk) {
+    return privilegedSession->run(args, output, [this, parseProgress, progressPrefix, &progressWindow](const QString &chunk) {
         if (parseProgress) {
             progressWindow += chunk;
-            if (progressWindow.size() > 4096)
-                progressWindow =
-                        progressWindow.right(4096);
-            parseTransferProgress(
-                    progressWindow,
-                    progressPrefix);
+            if (progressWindow.size() > 4096) progressWindow = progressWindow.right(4096);
+            parseTransferProgress(progressWindow, progressPrefix);
         }
-
-        const QStringList lines =
-                chunk.split(
-                    '\n',
-                    Qt::SkipEmptyParts);
-
+        const QStringList lines = chunk.split('\n', Qt::SkipEmptyParts);
         for (const QString &line : lines)
-            if (line.startsWith("STAGE:"))
-                statusLabel->setText(
-                        line.mid(6).trimmed());
-
-        if (outputCallback)
-            outputCallback(chunk);
+            if (line.startsWith("STAGE:")) statusLabel->setText(line.mid(6).trimmed());
     });
-
-    // If UI requests arrived during a standalone writer operation, service
-    // exactly one after this stack unwinds. During a transfer queue the target
-    // HDD is intentionally fixed, so nothing is scheduled until the queue ends.
-    if (!transferQueueRunning &&
-            diskRescanPending &&
-            !ps2RefreshInProgress) {
-        diskRescanPending = false;
-        ps2RefreshPending = false;
-        DebugTrace::write(
-                "runPrivilegedWriter: scheduling deferred physical disk rescan");
-        QTimer::singleShot(
-                0,
-                this,
-                &MainWindow::refreshDisks);
-    }
-    else if (!transferQueueRunning &&
-            ps2RefreshPending &&
-            !ps2RefreshInProgress) {
-        ps2RefreshPending = false;
-        DebugTrace::write(
-                "runPrivilegedWriter: scheduling deferred right-pane refresh");
-        QTimer::singleShot(
-                0,
-                this,
-                &MainWindow::refreshCurrentPs2Tree);
-    }
-
-    DebugTrace::write(
-            std::string("runPrivilegedWriter: return ok=") +
-            (ok ? "1" : "0") +
-            " outputBytes=" +
-            std::to_string(
-                output ? output->toUtf8().size() : 0));
-    return ok;
 #else
     Q_UNUSED(disk); Q_UNUSED(modeArguments); Q_UNUSED(output); Q_UNUSED(parseProgress); Q_UNUSED(progressPrefix);
     return false;
@@ -1054,10 +747,6 @@ bool MainWindow::runPrivilegedWriter(const Ps2::PhysicalDiskCandidate &disk,
 
 void MainWindow::populateInstalledGames(QTreeWidgetItem *gamesRoot, const Ps2::PhysicalDiskCandidate &disk)
 {
-    PS2_TRACE_SCOPE("MainWindow::populateInstalledGames");
-    DebugTrace::write(
-            "populateInstalledGames: device=" +
-            disk.devicePath);
     auto *dvd = new QTreeWidgetItem(gamesRoot);
     dvd->setText(0, "DVD"); dvd->setData(0, KindRole, NodeGamesMedia); dvd->setData(0, PathRole, "dvd");
     auto *cd = new QTreeWidgetItem(gamesRoot);
@@ -1070,140 +759,8 @@ void MainWindow::populateInstalledGames(QTreeWidgetItem *gamesRoot, const Ps2::P
         return;
     }
 
-    const quint64 treeGenerationBeforeRead =
-            ps2TreeGeneration;
-
     QString output;
-    QString scanProgressWindow;
-    DebugTrace::write(
-            "populateInstalledGames: BEGIN writer --list-games generation=" +
-            std::to_string(treeGenerationBeforeRead));
-    const bool gameListOk =
-            runPrivilegedWriter(
-            disk,
-            { "--hdl-dump", hdlDumpPath, "--list-games" },
-            &output,
-            false,
-            QString(),
-            [&](const QString &chunk)
-            {
-                scanProgressWindow += chunk;
-
-                int newline = -1;
-                while ((newline = scanProgressWindow.indexOf('\n')) >= 0)
-                {
-                    const QString line = scanProgressWindow.left(newline).trimmed();
-                    scanProgressWindow.remove(0, newline + 1);
-                    const QStringList fields = line.split('\t');
-
-                    if (fields.size() >= 5 && fields[0] == "APA_SCAN_PROGRESS")
-                    {
-                        bool bankOk=false, sliceOk=false, sectorOk=false, totalOk=false;
-                        const int bank = fields[1].toInt(&bankOk);
-                        const int slice = fields[2].toInt(&sliceOk);
-                        const qulonglong sector = fields[3].toULongLong(&sectorOk);
-                        const qulonglong total = fields[4].toULongLong(&totalOk);
-                        if (bankOk && sliceOk && sectorOk && totalOk && total > 0)
-                        {
-                            const int value = static_cast<int>(
-                                    std::min<qulonglong>(1000ULL,
-                                        sector * 1000ULL / total));
-                            transferProgress->setRange(0, 1000);
-                            transferProgress->setValue(
-                                    std::max(transferProgress->value(), value));
-                            transferProgress->setFormat(
-                                    QString("Bank %1 APA chain: %p%").arg(bank));
-                            progressDetail->setText(
-                                    QString("Scanning APA chain — Bank %1, slice %2: %3% through bank address space")
-                                            .arg(bank).arg(slice).arg(value / 10));
-                            transferProgress->setVisible(true);
-                            QApplication::processEvents();
-                        }
-                        continue;
-                    }
-
-                    if (fields.size() >= 4 && fields[0] == "APA_SCAN_DONE")
-                    {
-                        bool bankOk=false, sliceOk=false, totalOk=false;
-                        const int bank = fields[1].toInt(&bankOk);
-                        const int slice = fields[2].toInt(&sliceOk);
-                        fields[3].toULongLong(&totalOk);
-                        if (bankOk && sliceOk && totalOk)
-                        {
-                            transferProgress->setRange(0, 1000);
-                            transferProgress->setValue(1000);
-                            transferProgress->setFormat(
-                                    QString("Bank %1 APA chain: complete").arg(bank));
-                            progressDetail->setText(
-                                    QString("APA chain complete — Bank %1, slice %2. Reading game headers...")
-                                            .arg(bank).arg(slice));
-                            QApplication::processEvents();
-                        }
-                        continue;
-                    }
-
-                    if (fields.size() >= 3 && fields[0] == "HDL_SCAN_TOTAL")
-                    {
-                        bool bankOk=false, totalOk=false;
-                        const int bank = fields[1].toInt(&bankOk);
-                        const int total = fields[2].toInt(&totalOk);
-                        if (bankOk && totalOk && total >= 0)
-                        {
-                            transferProgress->setRange(0, std::max(1, total));
-                            transferProgress->setValue(0);
-                            transferProgress->setFormat(
-                                    QString("Bank %1 game headers: %p%").arg(bank));
-                            progressDetail->setText(
-                                    QString("Reading installed game headers — Bank %1: 0 / %2")
-                                            .arg(bank).arg(total));
-                            transferProgress->setVisible(true);
-                            QApplication::processEvents();
-                        }
-                        continue;
-                    }
-
-                    if (fields.size() >= 4 && fields[0] == "HDL_SCAN_PROGRESS")
-                    {
-                        bool bankOk=false, doneOk=false, totalOk=false;
-                        const int bank = fields[1].toInt(&bankOk);
-                        const int done = fields[2].toInt(&doneOk);
-                        const int total = fields[3].toInt(&totalOk);
-                        if (!bankOk || !doneOk || !totalOk || total <= 0)
-                            continue;
-
-                        const int bounded = std::clamp(done, 0, total);
-                        const int percent = bounded * 100 / total;
-                        transferProgress->setRange(0, total);
-                        transferProgress->setValue(bounded);
-                        transferProgress->setFormat(
-                                QString("Bank %1 game headers: %p%").arg(bank));
-                        progressDetail->setText(
-                                QString("Reading installed game headers — Bank %1: %2 / %3 (%4%)")
-                                        .arg(bank).arg(bounded).arg(total).arg(percent));
-                        statusLabel->setText(
-                                QString("Scanning installed PS2 games — Bank %1: %2 / %3")
-                                        .arg(bank).arg(bounded).arg(total));
-                        transferProgress->setVisible(true);
-                        QApplication::processEvents();
-                    }
-                }
-            });
-    DebugTrace::write(
-            std::string("populateInstalledGames: END writer --list-games ok=") +
-            (gameListOk ? "1" : "0") +
-            " outputBytes=" +
-            std::to_string(output.toUtf8().size()) +
-            " generationNow=" +
-            std::to_string(ps2TreeGeneration));
-
-    if (treeGenerationBeforeRead != ps2TreeGeneration) {
-        DebugTrace::write(
-                "populateInstalledGames: ABORTING parse because tree generation changed");
-        ps2RefreshPending = true;
-        return;
-    }
-
-    if (!gameListOk) {
+    if (!runPrivilegedWriter(disk, { "--hdl-dump", hdlDumpPath, "--list-games" }, &output)) {
         auto *note = new QTreeWidgetItem(gamesRoot);
         note->setText(0, "(could not read HDL game table)");
         note->setText(1, output.right(160));
@@ -1236,9 +793,6 @@ void MainWindow::populateInstalledGames(QTreeWidgetItem *gamesRoot, const Ps2::P
         item->setData(0, KindRole, NodeGame);
         count++;
     }
-    DebugTrace::write(
-            "populateInstalledGames: parsed game count=" +
-            std::to_string(count));
     gamesRoot->setText(3, QString("%1 game(s)").arg(count));
     dvd->setExpanded(true); cd->setExpanded(true);
 }
@@ -1246,14 +800,6 @@ void MainWindow::populateInstalledGames(QTreeWidgetItem *gamesRoot, const Ps2::P
 void MainWindow::populatePfsDirectory(QTreeWidgetItem *item, const QString &path,
         const Ps2::PhysicalDiskCandidate &disk, bool showErrors)
 {
-    PS2_TRACE_SCOPE("MainWindow::populatePfsDirectory");
-    DebugTrace::write(
-            "populatePfsDirectory: path=" +
-            path.toStdString() +
-            " device=" +
-            disk.devicePath +
-            " showErrors=" +
-            std::to_string(showErrors));
     if (!item) return;
     QString reason;
     if (!selectedDiskCanBrowsePfs(&reason)) {
@@ -1263,37 +809,9 @@ void MainWindow::populatePfsDirectory(QTreeWidgetItem *item, const QString &path
         return;
     }
 
-    const quint64 treeGenerationBeforeRead =
-            ps2TreeGeneration;
-
     QString output;
-    DebugTrace::write(
-            "populatePfsDirectory: BEGIN writer --list-pfs path=" +
-            path.toStdString() +
-            " generation=" +
-            std::to_string(treeGenerationBeforeRead));
-    const bool pfsListOk =
-            runPrivilegedWriter(
-                disk,
-                { "--pfsshell", pfsshellPath, "--list-pfs",
-                  "--partition", "auto", "--pfs-path", path },
-                &output);
-    DebugTrace::write(
-            std::string("populatePfsDirectory: END writer --list-pfs ok=") +
-            (pfsListOk ? "1" : "0") +
-            " outputBytes=" +
-            std::to_string(output.toUtf8().size()) +
-            " generationNow=" +
-            std::to_string(ps2TreeGeneration));
-
-    if (treeGenerationBeforeRead != ps2TreeGeneration) {
-        DebugTrace::write(
-                "populatePfsDirectory: ABORTING parse because tree generation changed");
-        ps2RefreshPending = true;
-        return;
-    }
-
-    if (!pfsListOk) {
+    if (!runPrivilegedWriter(disk,
+            { "--pfsshell", pfsshellPath, "--list-pfs", "--partition", "auto", "--pfs-path", path }, &output)) {
         while (item->childCount() > 0) delete item->takeChild(0);
         auto *note = new QTreeWidgetItem(item);
         note->setText(0, "(OPL PFS not available)");
@@ -1341,13 +859,6 @@ void MainWindow::populatePfsDirectory(QTreeWidgetItem *item, const QString &path
     }
     item->setData(0, PathRole, actualPath);
     item->setData(0, LoadedRole, true);
-    DebugTrace::write(
-            "populatePfsDirectory: completed childCount=" +
-            std::to_string(item->childCount()) +
-            " partition=" +
-            currentOplPartition.toStdString() +
-            " base=" +
-            currentOplBase.toStdString());
 }
 
 bool MainWindow::selectedDiskCanInstallGames(QString *reason) const
@@ -1591,10 +1102,6 @@ bool MainWindow::downloadArtworkFile(const QUrl &url, const QString &cachePath, 
 void MainWindow::addArtwork()
 {
 #ifdef __linux__
-    if (transferQueueRunning) {
-        statusBar()->showMessage("Artwork changes are disabled while the game queue is running.");
-        return;
-    }
     if (!unlockHddSession(true)) return;
     QString reason;
     if (!selectedDiskCanBrowsePfs(&reason)) {
@@ -1736,12 +1243,8 @@ void MainWindow::addArtwork()
         return;
     }
     const auto &disk = disks[static_cast<std::size_t>(diskIndex)];
-    QProgressDialog writeProgress(
-            QString("Writing %1 artwork file(s) directly into %2...\n\n"
-                    "The download/cache stage is complete; this stage writes the prepared batch to the PS2 HDD.")
-                    .arg(fileCount).arg(artPath),
-            QString(), 0, 1000, this);
-    writeProgress.setValue(0);
+    QProgressDialog writeProgress(QString("Writing %1 artwork file(s) directly into %2...\n\nThe download/cache stage is complete; this stage writes the prepared batch to the PS2 HDD.")
+            .arg(fileCount).arg(artPath), QString(), 0, 0, this);
     writeProgress.setWindowTitle("Installing OPL Artwork");
     writeProgress.setWindowModality(Qt::WindowModal);
     writeProgress.setMinimumDuration(0);
@@ -1752,61 +1255,8 @@ void MainWindow::addArtwork()
     QApplication::processEvents();
     statusLabel->setText("Installing artwork directly into OPL PFS storage...");
     QString output;
-    QString pfsProgressWindow;
-
-    const bool ok = runPrivilegedWriter(
-            disk,
-            { "--pfsshell", pfsshellPath, "--copy-manifest", manifestPath,
-              "--partition", currentOplPartition },
-            &output,
-            false,
-            QString(),
-            [&](const QString &chunk) {
-                pfsProgressWindow += chunk;
-
-                int nl = -1;
-                while ((nl = pfsProgressWindow.indexOf('\n')) >= 0)
-                {
-                    const QString line =
-                            pfsProgressWindow.left(nl).trimmed();
-                    pfsProgressWindow.remove(0, nl + 1);
-
-                    if (!line.startsWith("PFS_PROGRESS\t"))
-                        continue;
-
-                    const QStringList f = line.split('\t');
-                    if (f.size() < 5)
-                        continue;
-
-                    bool ok1=false, ok2=false, ok3=false, ok4=false;
-                    const qulonglong filesDone = f[1].toULongLong(&ok1);
-                    const qulonglong filesTotal = f[2].toULongLong(&ok2);
-                    const qulonglong bytesDone = f[3].toULongLong(&ok3);
-                    const qulonglong bytesTotal = f[4].toULongLong(&ok4);
-                    if (!ok1 || !ok2 || !ok3 || !ok4)
-                        continue;
-
-                    const int value = bytesTotal
-                            ? static_cast<int>(std::min<qulonglong>(
-                                  1000ULL,
-                                  bytesDone * 1000ULL / bytesTotal))
-                            : 0;
-
-                    writeProgress.setValue(value);
-                    writeProgress.setLabelText(
-                            QString("Writing artwork into %1...\n"
-                                    "%2 / %3 files committed\n%4 / %5")
-                                    .arg(artPath)
-                                    .arg(filesDone)
-                                    .arg(filesTotal)
-                                    .arg(formatBytes(bytesDone))
-                                    .arg(formatBytes(bytesTotal)));
-                    QApplication::processEvents();
-                }
-            });
-
-    if (ok)
-        writeProgress.setValue(1000);
+    const bool ok = runPrivilegedWriter(disk,
+            { "--pfsshell", pfsshellPath, "--copy-manifest", manifestPath, "--partition", currentOplPartition }, &output);
     writeProgress.close();
     QFile::remove(manifestPath);
     resetProgress();
@@ -2042,22 +1492,16 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
                 .arg(bankLabel(it.key()))
                 .arg(it.value());
 
-    // Copy the selected disk descriptor. Holding a reference into the
-    // disks vector across QApplication::processEvents() can become dangling
-    // if the UI refreshes/rebuilds the disk list during a long transfer.
-    const auto disk =
-            disks[static_cast<std::size_t>(
-                diskCombo->currentIndex())];
+    const auto &disk =
+            disks[static_cast<std::size_t>(diskCombo->currentIndex())];
 
     if (QMessageBox::question(
                 this,
                 "Install queued games to PS2 HDD",
                 QString("Install %1 queued game(s) as HDL APA partitions?\n\n"
                         "%2\n\nDestinations:\n%3\n\n"
-                        "You may keep browsing the PC and add more games while "
-                        "this queue runs. New marks join only at safe game boundaries. "
-                        "Existing titles are skipped only after startup identity/media "
-                        "and exact hdl_toc/cdvd_info2 size match.")
+                        "You can change the bank selector and add more games "
+                        "while this queue is running.")
                         .arg(static_cast<qulonglong>(games.size()))
                         .arg(QString::fromStdString(disk.devicePath))
                         .arg(initialDestinations.join('\n')),
@@ -2071,23 +1515,7 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
 
     qulonglong completedBytes = 0;
 
-    transferQueueRunning = true;
-
-    // Keep the target/raw-HDD side stable but leave the PC side and bank/AUTO
-    // selector responsive so more source games can be queued.
     copyToPs2Button->setEnabled(false);
-    if (diskCombo)
-        diskCombo->setEnabled(false);
-    if (ps2View)
-        ps2View->setEnabled(false);
-    if (addArtButton)
-        addArtButton->setEnabled(false);
-    if (installAppsButton)
-        installAppsButton->setEnabled(false);
-    if (applyOplDefaultsButton)
-        applyOplDefaultsButton->setEnabled(false);
-    if (unlockButton)
-        unlockButton->setEnabled(false);
 
     overallProgress->setRange(0, 100);
     overallProgress->setValue(0);
@@ -2111,113 +1539,51 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
     progressDetail->setVisible(true);
 
     QStringList installedResults;
-    QStringList skippedExistingResults;
 
-    enum class ExistingState
-    {
-        Absent,
-        Match,
-        Mismatch
-    };
-
-    struct ExistingCheck
-    {
-        ExistingState state =
-                ExistingState::Absent;
-        int bank = -1;
-        qulonglong installedKb = 0;
-        qulonglong sourceKb = 0;
-        QString media;
-        QString startup;
-        QString installedName;
-    };
-
-    auto checkExistingGame =
-            [&](const Game &game,
-                    ExistingCheck *result,
-                    QString *error) -> bool {
+    auto scanBank = [&](int bank, QString *scanOutput) -> bool {
         QString local;
-
-        const QStringList args = {
-            "--hdl-dump",
-            hdlDumpPath,
-            "--check-existing-game",
-            "--install-game",
-            game.path,
-            "--game-name",
-            game.name
+        const QStringList scanArgs = {
+            "--hdl-dump", hdlDumpPath,
+            "--list-games",
+            "--bank", QString::number(bank)
         };
+        const bool ok = runPrivilegedWriter(disk, scanArgs, &local);
+        if (scanOutput)
+            *scanOutput = local;
+        return ok;
+    };
 
-        if (!runPrivilegedWriter(
-                    disk,
-                    args,
-                    &local)) {
-            if (error)
-                *error = local;
+    auto scanContainsGame =
+            [&](const QString &wanted,
+                    int bank,
+                    QString *scanOutput,
+                    bool *scanSucceeded) -> bool {
+        QString local;
+        const bool ok = scanBank(bank, &local);
+
+        if (scanSucceeded)
+            *scanSucceeded = ok;
+        if (scanOutput)
+            *scanOutput = local;
+
+        if (!ok)
             return false;
-        }
 
         for (const QString &line :
-                local.split(
-                    '\n',
-                    Qt::SkipEmptyParts)) {
-            if (!line.startsWith(
-                        "EXISTING\t"))
+                local.split('\n', Qt::SkipEmptyParts)) {
+            if (!line.startsWith("GAME\t"))
                 continue;
 
             const QStringList fields =
                     line.split('\t');
 
-            if (fields.size() < 8)
-                continue;
-
-            ExistingCheck parsed;
-
-            const QString state =
+            if (!fields.isEmpty() &&
                     cleanMachineField(
-                        fields[1]);
-
-            if (state == "MATCH")
-                parsed.state =
-                        ExistingState::Match;
-            else if (state == "MISMATCH")
-                parsed.state =
-                        ExistingState::Mismatch;
-            else if (state == "ABSENT")
-                parsed.state =
-                        ExistingState::Absent;
-            else
-                continue;
-
-            parsed.bank =
-                    cleanMachineField(
-                        fields[2]).toInt();
-            parsed.installedKb =
-                    cleanMachineField(
-                        fields[3]).toULongLong();
-            parsed.sourceKb =
-                    cleanMachineField(
-                        fields[4]).toULongLong();
-            parsed.media =
-                    cleanMachineField(
-                        fields[5]);
-            parsed.startup =
-                    cleanMachineField(
-                        fields[6]);
-            parsed.installedName =
-                    cleanMachineField(
-                        fields[7]);
-
-            if (result)
-                *result = parsed;
-
-            return true;
+                        fields.last()).compare(
+                            wanted,
+                            Qt::CaseInsensitive) == 0)
+                return true;
         }
-
-        if (error)
-            *error =
-                    "Existing-game verification returned no machine record.\n" +
-                    local.right(1800);
 
         return false;
     };
@@ -2320,70 +1686,43 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
     bool queueAborted = false;
     QString queueAbortReason;
 
-    // PC browsing and queue marking stay live during the transfer. New marks
-    // are converted into Game records only at these explicit safe boundaries,
-    // never from inside the hdl_dump/progress event loop.
     auto appendLiveQueue = [&]() {
         QApplication::processEvents();
 
-        QStringList marked =
-                markedPcPaths.values();
+        QStringList marked = markedPcPaths.values();
         marked.sort(Qt::CaseInsensitive);
 
         int added = 0;
-
         for (const QString &path : marked) {
-            const QString key =
-                    normalizedLocalPath(path);
-
-            if (key.isEmpty() ||
-                    knownQueued.contains(key))
+            const QString key = normalizedLocalPath(path);
+            if (key.isEmpty() || knownQueued.contains(key))
                 continue;
 
-            const int bank =
-                    queuedPcBanks.value(
-                        key,
-                        fallbackBank);
+            const int bank = queuedPcBanks.value(key, fallbackBank);
 
-            Game newGame;
+            Game game;
             QString error;
-
-            if (!makeGame(
-                        path,
-                        bank,
-                        &newGame,
-                        &error)) {
+            if (!makeGame(path, bank, &game, &error)) {
                 knownQueued.insert(key);
-                failedResults <<
-                        QFileInfo(path).fileName() +
-                        " — could not be added to live queue: " +
-                        error;
+                failedResults << QFileInfo(path).fileName()
+                        + " — could not be added to live queue: " + error;
                 continue;
             }
 
-            knownQueued.insert(newGame.key);
-            games.push_back(newGame);
-            totalBytes += newGame.bytes;
+            knownQueued.insert(game.key);
+            games.push_back(game);
+            totalBytes += game.bytes;
             ++added;
         }
 
         if (added > 0) {
+            overallProgress->setProperty("queueTotalBytes", totalBytes);
             overallProgress->setProperty(
-                    "queueTotalBytes",
-                    totalBytes);
-            overallProgress->setProperty(
-                    "queueGameCount",
-                    static_cast<int>(
-                        games.size()));
-
+                    "queueGameCount", static_cast<int>(games.size()));
             statusBar()->showMessage(
-                    QString(
-                        "%1 new game(s) appended safely; "
-                        "%2 total in this run.")
-                        .arg(added)
-                        .arg(
-                            static_cast<qulonglong>(
-                                games.size())));
+                    QString("%1 new game(s) appended; %2 total in this run.")
+                            .arg(added)
+                            .arg(static_cast<qulonglong>(games.size())));
         }
     };
 
@@ -2415,9 +1754,7 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
     for (std::size_t i = 0; i < games.size(); ++i) {
         appendLiveQueue();
 
-        // Value copy: appendLiveQueue() may grow/reallocate `games`
-        // later in this iteration without invalidating the current item.
-        Game game = games[i];
+        Game &game = games[i];
 
         if (markedPcPaths.contains(game.key) &&
                 queuedPcBanks.contains(game.key))
@@ -2425,90 +1762,6 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
                     queuedPcBanks.value(
                         game.key,
                         game.bank);
-
-        statusLabel->setText(
-                QString(
-                    "Checking HDD for an existing size-matched copy of %1...")
-                    .arg(game.name));
-        QApplication::processEvents();
-
-        ExistingCheck existing;
-        QString existingError;
-
-        if (!checkExistingGame(
-                    game,
-                    &existing,
-                    &existingError)) {
-            queueAborted = true;
-            queueAbortReason =
-                    game.name +
-                    " — existing-game verification failed before any write:\n" +
-                    existingError.right(2200).trimmed();
-            failedResults <<
-                    queueAbortReason;
-            break;
-        }
-
-        if (existing.state ==
-                ExistingState::Match) {
-            skippedExistingResults <<
-                    QString(
-                        "%1 — %2 — Bank %3 — exact size match (%4 KB)%5")
-                        .arg(game.name)
-                        .arg(existing.media.isEmpty()
-                                ? game.media.toUpper()
-                                : existing.media.toUpper())
-                        .arg(existing.bank)
-                        .arg(existing.sourceKb)
-                        .arg(
-                            existing.startup.isEmpty()
-                                ? QString()
-                                : QString(" — %1")
-                                    .arg(existing.startup));
-
-            statusLabel->setText(
-                    QString(
-                        "%1 already exists on Bank %2 with an exact disc-size match — skipped.")
-                        .arg(game.name)
-                        .arg(existing.bank));
-
-            markedPcPaths.remove(game.key);
-            queuedPcBanks.remove(game.key);
-
-            transferProgress->setValue(100);
-            transferProgress->setFormat(
-                    "Existing game verified — skipped");
-
-            finishQueueItem(game, i);
-
-            if (pcView) {
-                pcView->viewport()->update();
-                pcView->update();
-            }
-
-            updateMarkedStatus();
-            QApplication::processEvents();
-            continue;
-        }
-
-        if (existing.state ==
-                ExistingState::Mismatch) {
-            queueAborted = true;
-            queueAbortReason =
-                    QString(
-                        "%1 matches an installed game identity on Bank %2, "
-                        "but the disc size/media does NOT match "
-                        "(installed %3 KB, selected image %4 KB). "
-                        "No duplicate was written.")
-                        .arg(game.name)
-                        .arg(existing.bank)
-                        .arg(existing.installedKb)
-                        .arg(existing.sourceKb);
-
-            failedResults <<
-                    queueAbortReason;
-            break;
-        }
 
         if (game.bank < 0) {
             bool resolved = false;
@@ -2612,10 +1865,24 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
         progressDetail->setVisible(true);
 
         statusLabel->setText(
-                QString("Starting self-verifying Bank %1 transaction for %2...")
+                QString("Re-scanning Bank %1 before %2...")
                         .arg(game.bank)
                         .arg(game.name));
         QApplication::processEvents();
+
+        QString preScan;
+        if (!scanBank(game.bank, &preScan)) {
+            queueAborted = true;
+            queueAbortReason =
+                    game.name +
+                    QString(
+                        " — Bank %1 pre-scan failed. No further writes were attempted:\n")
+                        .arg(game.bank) +
+                    preScan.right(1800).trimmed();
+
+            failedResults << queueAbortReason;
+            break;
+        }
 
         const QStringList installArgs = {
             "--hdl-dump", hdlDumpPath,
@@ -2626,47 +1893,108 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
         };
 
         QString output;
-        const bool installed =
-                runPrivilegedWriter(
-                    disk,
-                    installArgs,
-                    &output,
-                    true,
-                    prefix);
+        bool installed = runPrivilegedWriter(
+                disk, installArgs, &output, true, prefix);
+        bool usedRetry = false;
 
-        if (installed) {
-            if (output.contains(
-                        "GAME SKIPPED EXISTING SIZE MATCH")) {
-                skippedExistingResults <<
+        if (!installed) {
+            QString freshScan;
+            bool freshScanOk = false;
+
+            if (scanContainsGame(
+                        game.name,
+                        game.bank,
+                        &freshScan,
+                        &freshScanOk)) {
+                installed = true;
+
+                verificationWarnings <<
+                        game.name +
                         QString(
-                            "%1 — Bank %2 — exact size match "
-                            "(writer-side race check)")
-                            .arg(game.name)
+                            " — writer reported an error, but a fresh Bank %1 scan confirms the title is present.")
                             .arg(game.bank);
             }
-            else {
-                installedResults <<
-                        QString("%1 — %2 — Bank %3")
-                        .arg(game.name)
-                        .arg(game.media.toUpper())
-                        .arg(game.bank);
-            }
+            else if (!freshScanOk) {
+                queueAborted = true;
 
-            markedPcPaths.remove(game.key);
-            queuedPcBanks.remove(game.key);
+                queueAbortReason =
+                        game.name +
+                        QString(
+                            " — install failed and the fresh Bank %1 verification scan also failed. No retry/no further writes:\n")
+                            .arg(game.bank) +
+                        freshScan.right(1800).trimmed();
+
+                failedResults << queueAbortReason;
+            }
+            else {
+                statusLabel->setText(
+                        "Install attempt failed for " +
+                        game.name +
+                        ". Fresh destination-bank scan proves it is absent; retrying once...");
+
+                QApplication::processEvents();
+
+                usedRetry = true;
+                output.clear();
+
+                installed = runPrivilegedWriter(
+                        disk,
+                        installArgs,
+                        &output,
+                        true,
+                        prefix + " — retry");
+            }
+        }
+
+        if (queueAborted)
+            break;
+
+        if (installed) {
+            QString verifyScan;
+            bool verifyScanOk = false;
+
+            if (scanContainsGame(
+                        game.name,
+                        game.bank,
+                        &verifyScan,
+                        &verifyScanOk)) {
+                installedResults << QString("%1 — Bank %2")
+                        .arg(game.name)
+                        .arg(game.bank);
+
+                if (usedRetry)
+                    retriedResults << QString("%1 — Bank %2")
+                            .arg(game.name)
+                            .arg(game.bank);
+
+                markedPcPaths.remove(game.key);
+                queuedPcBanks.remove(game.key);
+            }
+            else if (!verifyScanOk) {
+                queueAborted = true;
+
+                queueAbortReason =
+                        game.name +
+                        QString(
+                            " — writer completed, but the fresh Bank %1 verification scan failed. No further writes:\n")
+                            .arg(game.bank) +
+                        verifyScan.right(1800).trimmed();
+
+                failedResults << queueAbortReason;
+            }
+            else {
+                failedResults <<
+                        game.name +
+                        QString(
+                            " — writer completed, but a fresh Bank %1 scan did not find the title.")
+                            .arg(game.bank);
+            }
         }
         else {
-            // Never blindly retry a failed raw-HDD transaction.
-            queueAborted = true;
-            queueAbortReason =
-                    QString("%1 — Bank %2 writer transaction failed. "
-                            "No automatic retry and no further HDD writes:\n%3")
+            failedResults << QString("%1 — Bank %2 — %3")
                     .arg(game.name)
                     .arg(game.bank)
-                    .arg(output.right(5000).trimmed());
-
-            failedResults << queueAbortReason;
-            break;
+                    .arg(output.right(900).trimmed());
         }
 
         transferProgress->setValue(100);
@@ -2686,20 +2014,6 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
         if (queueAborted)
             break;
     }
-
-    transferQueueRunning = false;
-
-    if (diskCombo)
-        diskCombo->setEnabled(true);
-    if (ps2View)
-        ps2View->setEnabled(true);
-    if (addArtButton)
-        addArtButton->setEnabled(true);
-    if (installAppsButton)
-        installAppsButton->setEnabled(true);
-    if (applyOplDefaultsButton)
-        applyOplDefaultsButton->setEnabled(true);
-    updateUnlockUi();
 
     copyToPs2Button->setEnabled(
             selectedDiskCanInstallGames());
@@ -2728,31 +2042,18 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
     QApplication::processEvents();
     refreshCurrentPs2Tree();
 
-    const int successfulCount =
-            installedResults.size() +
-            skippedExistingResults.size();
-
     QString summary =
-            QString(
-                "Processed successfully: %1 / %2\n"
-                "Newly installed: %3\n"
-                "Already present + exact size match: %4")
-                .arg(successfulCount)
-                .arg(
-                    static_cast<qulonglong>(
-                        games.size()))
-                .arg(installedResults.size())
-                .arg(skippedExistingResults.size());
+            QString("Installed: %1 / %2")
+                    .arg(installedResults.size())
+                    .arg(static_cast<qulonglong>(games.size()));
 
     if (!installedResults.isEmpty())
-        summary +=
-                "\n\nInstalled games — media / destination:\n  " +
-                installedResults.join("\n  ");
+        summary += "\n\nInstalled destinations:\n  "
+                + installedResults.join("\n  ");
 
-    if (!skippedExistingResults.isEmpty())
-        summary +=
-                "\n\nAlready present — verified size match:\n  " +
-                skippedExistingResults.join("\n  ");
+    if (!retriedResults.isEmpty())
+        summary += "\n\nSucceeded on automatic retry:\n  "
+                + retriedResults.join("\n  ");
 
     if (!failedResults.isEmpty())
         summary += "\n\nFailed (left queued when applicable):\n  "
@@ -2769,28 +2070,12 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
                 queueAbortReason +
                 "\nRemaining marked games were left queued and were not written.";
 
-    {
-        QDialog resultDialog(this);
-        resultDialog.setWindowTitle("HDL game queue results");
-        resultDialog.resize(820, 720);
-
-        auto *resultLayout = new QVBoxLayout(&resultDialog);
-
-        auto *summaryView = new QPlainTextEdit(&resultDialog);
-        summaryView->setReadOnly(true);
-        summaryView->setLineWrapMode(QPlainTextEdit::WidgetWidth);
-        summaryView->setPlainText(summary);
-        summaryView->moveCursor(QTextCursor::Start);
-        resultLayout->addWidget(summaryView, 1);
-
-        auto *resultButtons = new QDialogButtonBox(
-                QDialogButtonBox::Ok, &resultDialog);
-        connect(resultButtons, &QDialogButtonBox::accepted,
-                &resultDialog, &QDialog::accept);
-        resultLayout->addWidget(resultButtons);
-
-        resultDialog.exec();
-    }
+    QMessageBox::information(
+            this,
+            failedResults.isEmpty()
+                    ? "HDL game installation complete"
+                    : "HDL game queue completed with errors",
+            summary);
 
     resetProgress();
 #else
@@ -2855,11 +2140,6 @@ bool MainWindow::createPfsCopyManifest(const QStringList &paths, const QString &
 void MainWindow::copyPcItemsToPfs(const QStringList &paths, QTreeWidgetItem *target)
 {
 #ifdef __linux__
-    if (transferQueueRunning) {
-        statusBar()->showMessage(
-                "PFS file writes are disabled while the game queue is running.");
-        return;
-    }
     if (!unlockHddSession(true)) return;
     QString reason;
     if (!selectedDiskCanBrowsePfs(&reason)) { QMessageBox::warning(this, "PFS copy unavailable", reason); return; }
@@ -2901,10 +2181,6 @@ void MainWindow::copyPcItemsToPfs(const QStringList &paths, QTreeWidgetItem *tar
 void MainWindow::installOrUpdateOplApps()
 {
 #ifdef __linux__
-    if (transferQueueRunning) {
-        statusBar()->showMessage("OPL app writes are disabled while the game queue is running.");
-        return;
-    }
     if (!unlockHddSession(true)) return;
     QString reason;
     if (!selectedDiskCanBrowsePfs(&reason)) {
@@ -3204,10 +2480,6 @@ void MainWindow::installOrUpdateOplApps()
 void MainWindow::applyRecommendedOplDefaults()
 {
 #ifdef __linux__
-    if (transferQueueRunning) {
-        statusBar()->showMessage("OPL configuration writes are disabled while the game queue is running.");
-        return;
-    }
     if (!unlockHddSession(true)) return;
     QString reason;
     if (!selectedDiskCanBrowsePfs(&reason)) {

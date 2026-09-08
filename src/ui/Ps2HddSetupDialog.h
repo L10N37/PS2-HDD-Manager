@@ -56,10 +56,12 @@ private:
     QCheckBox *configureOplCheck = nullptr;
     QCheckBox *installWleCheck = nullptr;
     QCheckBox *installMcaCheck = nullptr;
+    QCheckBox *installFceummCheck = nullptr;
     QCheckBox *installFhdbCheck = nullptr;
     QCheckBox *installEnablerCheck = nullptr;
     QCheckBox *createFreeDvdBootCheck = nullptr;
     QComboBox *freeDvdBootProfile = nullptr;
+    QComboBox *appsStorageSize = nullptr;
     QTreeWidget *diskList = nullptr;
     QLabel *detailsLabel = nullptr;
     QLabel *statusLabel = nullptr;

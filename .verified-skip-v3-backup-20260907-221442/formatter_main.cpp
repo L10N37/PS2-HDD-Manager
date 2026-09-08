@@ -54,7 +54,6 @@ struct Options
     bool listPfs = false;
     bool ensureCoverArt = false;
     bool bankSpace = false;
-    bool checkExistingGame = false;
     std::uint64_t requiredBytes = 0;
     std::uint32_t appsSizeMiB =
             Ps2::Ps2HddFormat::DefaultAppsSizeMiB;
@@ -67,8 +66,6 @@ struct Options
 [[noreturn]] void usage(const char *program)
 {
     std::cerr
-        << "PS2 HDD Writer: command-line mode validation failed.\n"
-        << "The operation was rejected before any HDD write.\n\n"
         << "Usage:\n"
         << "  " << program << " --device /dev/sdX --expected-size BYTES --pfsshell PATH [format options]\n"
         << "  " << program << " --smoke-image IMAGE --pfsshell PATH\n"
@@ -113,7 +110,6 @@ Options parseOptions(int argc, char **argv)
         if (argument == "--list-pfs") { options.listPfs = true; continue; }
         if (argument == "--ensure-cover-art") { options.ensureCoverArt = true; continue; }
         if (argument == "--bank-space") { options.bankSpace = true; continue; }
-        if (argument == "--check-existing-game") { options.checkExistingGame = true; continue; }
         if (argument == "--extended-banks") { options.extendedBanks = true; continue; }
         if (index + 1 >= argc)
             usage(argv[0]);
@@ -154,21 +150,6 @@ Options parseOptions(int argc, char **argv)
     const bool coverArtMode = commonPhysical && options.ensureCoverArt && !options.pfsshell.empty() &&
             options.hdlDump.empty() && options.installGame.empty() && !options.provision.any() && !options.listGames &&
             !options.listPfs && options.copyManifest.empty();
-    const bool checkExistingMode =
-            commonPhysical &&
-            options.checkExistingGame &&
-            !options.hdlDump.empty() &&
-            !options.installGame.empty() &&
-            !options.gameName.empty() &&
-            options.media.empty() &&
-            options.pfsshell.empty() &&
-            !options.provision.any() &&
-            !options.listGames &&
-            !options.listPfs &&
-            !options.ensureCoverArt &&
-            !options.bankSpace &&
-            options.copyManifest.empty();
-
     const bool bankSpaceMode =
             commonPhysical &&
             options.bankSpace &&
@@ -195,8 +176,7 @@ Options parseOptions(int argc, char **argv)
             options.expectedSize == 0 && !options.pfsshell.empty() && !options.provision.any() &&
             options.installGame.empty() && !options.listGames && !options.listPfs && !options.ensureCoverArt && options.copyManifest.empty();
     if (!physicalMode && !smokeMode && !gameMode && !listGamesMode &&
-            !listPfsMode && !copyPfsMode && !coverArtMode &&
-            !bankSpaceMode && !checkExistingMode)
+            !listPfsMode && !copyPfsMode && !coverArtMode && !bankSpaceMode)
         usage(argv[0]);
     if (physicalMode && options.provision.any() && options.payloadDirectory.empty())
         usage(argv[0]);
@@ -951,9 +931,7 @@ void verifyGameBank(const Options &options, int bank)
     if (bank == 0) Ps2::Ps2HddFormat::VerifyStandardApaDisk(options.device, options.expectedSize);
 }
 
-std::string runHdlDumpInstall(
-        const Options &options,
-        const std::string &startup)
+std::string runHdlDumpInstall(const Options &options)
 {
     int outputPipe[2];
     if (pipe(outputPipe) != 0)
@@ -969,43 +947,11 @@ std::string runHdlDumpInstall(
         dup2(outputPipe[1], STDERR_FILENO);
         close(outputPipe[0]);
         close(outputPipe[1]);
-        const char *command =
-                options.media == "cd" ? "inject_cd" : "inject_dvd";
-        const std::string target =
-                bankedDevicePath(
-                    options,
-                    options.bank < 0 ? 0 : options.bank);
-
-        // deterministic HDL inject arguments:
-        // - pass the startup ID we already verified with cdvd_info2
-        // - pass *u4 explicitly so hdl_dump never depends on a mutable
-        //   per-user/root default_dma configuration value
-        if (!startup.empty())
-        {
-            execl(
-                    options.hdlDump.c_str(),
-                    options.hdlDump.c_str(),
-                    command,
-                    target.c_str(),
-                    options.gameName.c_str(),
-                    options.installGame.c_str(),
-                    startup.c_str(),
-                    "*u4",
-                    static_cast<char *>(nullptr));
-        }
-        else
-        {
-            execl(
-                    options.hdlDump.c_str(),
-                    options.hdlDump.c_str(),
-                    command,
-                    target.c_str(),
-                    options.gameName.c_str(),
-                    options.installGame.c_str(),
-                    "*u4",
-                    static_cast<char *>(nullptr));
-        }
-
+        const char *command = options.media == "cd" ? "inject_cd" : "inject_dvd";
+        const std::string target = bankedDevicePath(options, options.bank < 0 ? 0 : options.bank);
+        execl(options.hdlDump.c_str(), options.hdlDump.c_str(), command,
+                target.c_str(), options.gameName.c_str(), options.installGame.c_str(),
+                static_cast<char*>(nullptr));
         _exit(127);
     }
     close(outputPipe[1]);
@@ -1054,11 +1000,7 @@ std::string runHdlDumpInstall(
                 options.hdlDump + " " +
                 command + " " +
                 target +
-                " <game-name> <image> " +
-                (startup.empty()
-                    ? std::string()
-                    : std::string("<startup> ")) +
-                "*u4\n"
+                " <game-name> <image>\n"
                 "Output tail:\n" +
                 tail);
     }
@@ -1071,98 +1013,38 @@ std::string runHdlDumpToc(const Options &options, int bank)
     int outputPipe[2];
     if (pipe(outputPipe) != 0)
         throw std::runtime_error("Unable to create hdl_dump verification pipe.");
-
     const pid_t child = fork();
     if (child < 0)
         throw std::runtime_error("Unable to start hdl_dump verification.");
-
     if (child == 0)
     {
         dup2(outputPipe[1], STDOUT_FILENO);
         dup2(outputPipe[1], STDERR_FILENO);
-        close(outputPipe[0]);
-        close(outputPipe[1]);
-
-        setenv("PS2_HDD_SCAN_PROGRESS", "1", 1);
-
+        close(outputPipe[0]); close(outputPipe[1]);
         const std::string target = bankedDevicePath(options, bank);
         execl(options.hdlDump.c_str(), options.hdlDump.c_str(), "hdl_toc",
                 target.c_str(), "--csv", static_cast<char*>(nullptr));
         _exit(127);
     }
-
     close(outputPipe[1]);
-
     std::string log;
-    std::string live;
     char buffer[4096];
-
-    auto forwardProgressLine = [bank](const std::string &line)
-    {
-        for (const char *prefix : {
-                "APA_SCAN_PROGRESS\t",
-                "APA_SCAN_DONE\t",
-                "HDL_SCAN_TOTAL\t",
-                "HDL_SCAN_PROGRESS\t" })
-        {
-            const std::string p(prefix);
-            if (line.rfind(p, 0) == 0)
-            {
-                std::cout << p << bank << "\t"
-                          << line.substr(p.size()) << "\n"
-                          << std::flush;
-                return;
-            }
-        }
-    };
-
     for (;;)
     {
         const ssize_t received = read(outputPipe[0], buffer, sizeof(buffer));
-        if (received > 0)
-        {
-            log.append(buffer, static_cast<std::size_t>(received));
-            live.append(buffer, static_cast<std::size_t>(received));
-
-            std::size_t newline;
-            while ((newline = live.find('\n')) != std::string::npos)
-            {
-                std::string line = live.substr(0, newline);
-                if (!line.empty() && line.back() == '\r')
-                    line.pop_back();
-                live.erase(0, newline + 1);
-                forwardProgressLine(line);
-            }
-            continue;
-        }
-
-        if (received == 0)
-            break;
-        if (errno == EINTR)
-            continue;
-
+        if (received > 0) { log.append(buffer, static_cast<std::size_t>(received)); continue; }
+        if (received == 0) break;
+        if (errno == EINTR) continue;
         close(outputPipe[0]);
         throw std::runtime_error("Reading hdl_dump verification output failed.");
     }
-
     close(outputPipe[0]);
-
-    if (!live.empty())
-    {
-        if (live.back() == '\r')
-            live.pop_back();
-        forwardProgressLine(live);
-    }
-
     int status = 0;
-    if (waitpid(child, &status, 0) < 0 ||
-            !WIFEXITED(status) ||
-            WEXITSTATUS(status) != 0)
-        throw std::runtime_error(
-                "hdl_dump could not verify the installed game list.");
-
+    if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        throw std::runtime_error("hdl_dump could not verify the installed game list.");
     return log;
 }
+
 
 std::string trim(std::string value)
 {
@@ -1196,207 +1078,6 @@ std::vector<std::string> splitCsvLimit(const std::string &line, std::size_t fiel
     }
     fields.push_back(trim(line.substr(begin)));
     return fields;
-}
-
-struct HdlInstalledRecord
-{
-    std::string media;
-    std::uint64_t sizeKb = 0;
-    std::string startup;
-    std::string name;
-};
-
-struct SourceDiscRecord
-{
-    std::string media;
-    std::uint64_t sizeKb = 0;
-    std::string startup;
-};
-
-std::uint64_t parseKbValue(std::string value)
-{
-    value = trim(value);
-    if (value.size() >= 2 &&
-            value.substr(value.size() - 2) == "KB")
-        value.resize(value.size() - 2);
-    value = trim(value);
-    if (value.empty())
-        throw std::runtime_error("Empty KB size field.");
-    return std::stoull(value);
-}
-
-std::vector<HdlInstalledRecord> parseInstalledRecords(
-        const std::string &toc)
-{
-    std::vector<HdlInstalledRecord> records;
-    std::istringstream lines(toc);
-    std::string line;
-
-    while (std::getline(lines, line))
-    {
-        const std::vector<std::string> f =
-                splitCsvLimit(trim(line), 6);
-
-        if (f.size() != 6 ||
-                (f[0] != "DVD" && f[0] != "CD"))
-            continue;
-
-        records.push_back({
-                f[0],
-                parseKbValue(f[1]),
-                cleanField(f[4]),
-                cleanField(f[5])
-        });
-    }
-
-    return records;
-}
-
-std::string runHdlDumpCdvdInfo(const Options &options)
-{
-    int outputPipe[2];
-    if (pipe(outputPipe) != 0)
-        throw std::runtime_error(
-                "Unable to create cdvd_info2 pipe.");
-
-    const pid_t child = fork();
-    if (child < 0)
-        throw std::runtime_error(
-                "Unable to start hdl_dump cdvd_info2.");
-
-    if (child == 0)
-    {
-        dup2(outputPipe[1], STDOUT_FILENO);
-        dup2(outputPipe[1], STDERR_FILENO);
-        close(outputPipe[0]);
-        close(outputPipe[1]);
-
-        execl(
-                options.hdlDump.c_str(),
-                options.hdlDump.c_str(),
-                "cdvd_info2",
-                options.installGame.c_str(),
-                "--csv",
-                static_cast<char *>(nullptr));
-        _exit(127);
-    }
-
-    close(outputPipe[1]);
-
-    std::string log;
-    char buffer[4096];
-
-    for (;;)
-    {
-        const ssize_t received =
-                read(outputPipe[0],
-                    buffer,
-                    sizeof(buffer));
-
-        if (received > 0)
-        {
-            log.append(
-                    buffer,
-                    static_cast<std::size_t>(
-                        received));
-            continue;
-        }
-
-        if (received == 0)
-            break;
-
-        if (errno == EINTR)
-            continue;
-
-        close(outputPipe[0]);
-        throw std::runtime_error(
-                "Reading cdvd_info2 output failed.");
-    }
-
-    close(outputPipe[0]);
-
-    int status = 0;
-    if (waitpid(child, &status, 0) < 0 ||
-            !WIFEXITED(status) ||
-            WEXITSTATUS(status) != 0)
-        throw std::runtime_error(
-                "hdl_dump cdvd_info2 could not inspect the source image.");
-
-    return log;
-}
-
-SourceDiscRecord inspectSourceDisc(
-        const Options &options)
-{
-    const std::string output =
-            runHdlDumpCdvdInfo(options);
-
-    std::istringstream lines(output);
-    std::string line;
-
-    while (std::getline(lines, line))
-    {
-        std::vector<std::string> f =
-                splitCsvLimit(trim(line), 4);
-
-        if (f.size() != 4)
-            continue;
-
-        std::string media =
-                trim(f[0]);
-
-        static const std::string dualPrefix =
-                "dual-layer ";
-
-        if (media.rfind(dualPrefix, 0) == 0)
-            media.erase(0, dualPrefix.size());
-
-        if (media != "DVD" && media != "CD")
-            continue;
-
-        return {
-                media,
-                parseKbValue(f[1]),
-                cleanField(f[3])
-        };
-    }
-
-    throw std::runtime_error(
-            "Could not parse cdvd_info2 media/size/startup information.");
-}
-
-bool sameGameIdentity(
-        const HdlInstalledRecord &installed,
-        const SourceDiscRecord &source,
-        const std::string &requestedName)
-{
-    if (!source.startup.empty())
-        return installed.startup == source.startup;
-
-    return installed.name == requestedName;
-}
-
-const HdlInstalledRecord *findInstalledIdentity(
-        const std::vector<HdlInstalledRecord> &records,
-        const SourceDiscRecord &source,
-        const std::string &requestedName)
-{
-    for (const auto &record : records)
-        if (sameGameIdentity(
-                    record,
-                    source,
-                    requestedName))
-            return &record;
-
-    return nullptr;
-}
-
-bool exactDiscMatch(
-        const HdlInstalledRecord &installed,
-        const SourceDiscRecord &source)
-{
-    return installed.media == source.media &&
-            installed.sizeKb == source.sizeKb;
 }
 
 void emitGameRecords(const std::string &toc, int bank)
@@ -1585,31 +1266,20 @@ void copyManifestToPfs(const Options &options)
 {
     const std::string partition = resolvePfsPartition(options);
     const std::vector<ManifestEntry> entries = readCopyManifest(options.copyManifest);
+    std::string script = "device " + bankedDevicePath(options, 0) + "\nmount " + partition + "\n";
 
-    std::size_t totalFiles = 0;
-    std::uint64_t totalBytes = 0;
-    for (const ManifestEntry &entry : entries)
-    {
-        if (entry.directory)
-            continue;
-        std::error_code ec;
-        const auto bytes = fs::file_size(entry.local, ec);
-        if (ec)
-            throw std::runtime_error("Unable to size PFS source file: " + entry.local);
-        ++totalFiles;
-        totalBytes += bytes;
-    }
-
-    constexpr std::size_t MaxFilesPerBatch = 64;
-    constexpr std::uint64_t MaxBytesPerBatch = 32ULL * 1024ULL * 1024ULL;
-
+    // pfsshell's `put` command uses one filename for both the host source and
+    // PFS destination. For a manifest entry that renames while copying (for
+    // example our temporary file -> conf_opl.cfg), expose the source through a
+    // temporary symlink whose basename already matches the requested remote
+    // filename. This lets `put` replace the final name directly and avoids a
+    // rename-over-existing-file edge case.
     fs::path aliasRoot;
     auto ensureAliasRoot = [&]() -> const fs::path & {
-        if (aliasRoot.empty())
-        {
+        if (aliasRoot.empty()) {
             char pattern[] = "/tmp/ps2-hdd-pfs-alias-XXXXXX";
             char *created = mkdtemp(pattern);
-            if (!created)
+            if (created == nullptr)
                 throw std::runtime_error("Unable to create temporary PFS alias directory: " +
                         std::string(std::strerror(errno)));
             aliasRoot = created;
@@ -1617,135 +1287,52 @@ void copyManifestToPfs(const Options &options)
         return aliasRoot;
     };
 
-    std::size_t aliasIndex = 0;
-    std::size_t completedFiles = 0;
-    std::uint64_t completedBytes = 0;
-    std::vector<ManifestEntry> batch;
-    std::size_t batchFiles = 0;
-    std::uint64_t batchBytes = 0;
-
-    auto runBatch = [&]()
-    {
-        if (batch.empty())
-            return;
-
-        std::string script = "device " + bankedDevicePath(options, 0) +
-                "\nmount " + partition + "\n";
-        std::size_t committedFiles = 0;
-        std::uint64_t committedBytes = 0;
-
-        for (const ManifestEntry &entry : batch)
+    try {
+        std::size_t index = 0;
+        for (const ManifestEntry &entry : entries)
         {
             if (entry.directory)
             {
                 appendEnsureDirectory(script, entry.remote);
                 continue;
             }
-
             const fs::path local(entry.local);
             const fs::path remote(entry.remote);
-            const std::string remoteParent =
-                    remote.parent_path().generic_string().empty()
-                    ? "/"
-                    : remote.parent_path().generic_string();
-
+            const std::string remoteParent = remote.parent_path().generic_string().empty() ? "/" : remote.parent_path().generic_string();
             appendEnsureDirectory(script, remoteParent);
 
             fs::path effectiveLocal = local;
             if (local.filename() != remote.filename())
             {
-                const fs::path aliasDir =
-                        ensureAliasRoot() / std::to_string(aliasIndex++);
+                const fs::path aliasDir = ensureAliasRoot() / std::to_string(index++);
                 fs::create_directories(aliasDir);
                 effectiveLocal = aliasDir / remote.filename();
-
-                std::error_code ec;
-                fs::create_symlink(fs::absolute(local), effectiveLocal, ec);
-                if (ec)
-                    throw std::runtime_error(
-                            "Unable to stage PFS destination filename: " +
-                            remote.filename().string());
+                std::error_code error;
+                fs::create_symlink(fs::absolute(local), effectiveLocal, error);
+                if (error)
+                    throw std::runtime_error("Unable to stage PFS destination filename " +
+                            remote.filename().string() + ": " + error.message());
             }
 
-            script += "lcd " +
-                    quotePfsshellToken(effectiveLocal.parent_path().string()) +
-                    "\n";
-            script += "put " +
-                    quotePfsshellToken(effectiveLocal.filename().string()) +
-                    "\n";
-
-            std::error_code ec;
-            const auto bytes = fs::file_size(local, ec);
-            if (ec)
-                throw std::runtime_error("Unable to size PFS source file during copy.");
-            ++committedFiles;
-            committedBytes += bytes;
+            script += "lcd " + quotePfsshellToken(effectiveLocal.parent_path().string()) + "\n";
+            script += "put " + quotePfsshellToken(effectiveLocal.filename().string()) + "\n";
         }
-
         script += "cd /\numount\nexit\n";
         runPfsshell(options.pfsshell, script);
-
-        completedFiles += committedFiles;
-        completedBytes += committedBytes;
-
-        std::cout << "PFS_PROGRESS\t"
-                  << completedFiles << "\t"
-                  << totalFiles << "\t"
-                  << completedBytes << "\t"
-                  << totalBytes << "\n"
-                  << std::flush;
-
-        batch.clear();
-        batchFiles = 0;
-        batchBytes = 0;
-    };
-
-    try
-    {
-        for (const ManifestEntry &entry : entries)
-        {
-            if (entry.directory)
-            {
-                batch.push_back(entry);
-                continue;
-            }
-
-            std::error_code ec;
-            const auto fileBytes = fs::file_size(entry.local, ec);
-            if (ec)
-                throw std::runtime_error("Unable to size PFS source file: " + entry.local);
-
-            if (batchFiles != 0 &&
-                    (batchFiles >= MaxFilesPerBatch ||
-                     batchBytes + fileBytes > MaxBytesPerBatch))
-                runBatch();
-
-            batch.push_back(entry);
-            ++batchFiles;
-            batchBytes += fileBytes;
-        }
-
-        runBatch();
     }
     catch (...)
     {
-        if (!aliasRoot.empty())
-        {
+        if (!aliasRoot.empty()) {
             std::error_code ignored;
             fs::remove_all(aliasRoot, ignored);
         }
         throw;
     }
-
-    if (!aliasRoot.empty())
-    {
+    if (!aliasRoot.empty()) {
         std::error_code ignored;
         fs::remove_all(aliasRoot, ignored);
     }
-
-    std::cout << "PFS_COPY_SUCCESS\t"
-              << partition << "\t"
-              << totalFiles << "\n";
+    std::cout << "PFS_COPY_SUCCESS\t" << partition << "\t" << entries.size() << "\n";
 }
 
 void ensureCoverArtConfig(const Options &options)
@@ -2077,81 +1664,6 @@ int main(int argc, char **argv)
 #endif
         const Options options = parseOptions(argc, argv);
 #ifdef __linux__
-        if (options.checkExistingGame)
-        {
-            std::cout
-                    << "STAGE: Checking all APA banks for an existing copy with matching disc size...\n"
-                    << std::flush;
-
-            preflight(options);
-
-            const SourceDiscRecord source =
-                    inspectSourceDisc(options);
-
-            const std::uint32_t count =
-                    plannedBankCount(options);
-
-            for (std::uint32_t bank = 0;
-                    bank < count;
-                    ++bank)
-            {
-                if (!bankHasValidMbr(options, bank))
-                    continue;
-
-                const auto records =
-                        parseInstalledRecords(
-                            runHdlDumpToc(
-                                options,
-                                static_cast<int>(bank)));
-
-                const HdlInstalledRecord *existing =
-                        findInstalledIdentity(
-                            records,
-                            source,
-                            options.gameName);
-
-                if (!existing)
-                    continue;
-
-                const bool match =
-                        exactDiscMatch(
-                            *existing,
-                            source);
-
-                std::cout
-                        << "EXISTING\t"
-                        << (match ? "MATCH" : "MISMATCH")
-                        << "\t"
-                        << bank
-                        << "\t"
-                        << existing->sizeKb
-                        << "\t"
-                        << source.sizeKb
-                        << "\t"
-                        << existing->media
-                        << "\t"
-                        << cleanField(source.startup)
-                        << "\t"
-                        << cleanField(existing->name)
-                        << "\n";
-
-                return 0;
-            }
-
-            std::cout
-                    << "EXISTING\tABSENT\t-1\t0\t"
-                    << source.sizeKb
-                    << "\t"
-                    << source.media
-                    << "\t"
-                    << cleanField(source.startup)
-                    << "\t"
-                    << cleanField(options.gameName)
-                    << "\n";
-
-            return 0;
-        }
-
         if (options.bankSpace)
         {
             std::cout
@@ -2260,95 +1772,16 @@ int main(int argc, char **argv)
             std::cout << "STAGE: Re-checking target identity and safety for HDL game install...\n" << std::flush;
             preflight(options);
             const int bank = options.bank < 0 ? 0 : options.bank;
-            std::cout << "STAGE: Verifying APA Bank " << bank
-                      << " before HDL game transaction...\n" << std::flush;
+            std::cout << "STAGE: Verifying APA Bank " << bank << " before HDL game install...\n" << std::flush;
             verifyGameBank(options, bank);
-
-            const SourceDiscRecord source =
-                    inspectSourceDisc(options);
-
-            const std::string expectedMedia =
-                    options.media == "cd" ? "CD" : "DVD";
-
-            if (source.media != expectedMedia)
-                throw std::runtime_error(
-                        "Source media probe disagrees with the requested HDL media type.");
-
-            std::cout << "STAGE: Checking Bank " << bank
-                      << " for the same startup ID/name and exact disc size...\n"
-                      << std::flush;
-
-            const auto beforeRecords =
-                    parseInstalledRecords(
-                        runHdlDumpToc(options, bank));
-
-            const HdlInstalledRecord *before =
-                    findInstalledIdentity(
-                        beforeRecords,
-                        source,
-                        options.gameName);
-
-            if (before)
-            {
-                if (!exactDiscMatch(*before, source))
-                    throw std::runtime_error(
-                            "An installed game has the same identity but its "
-                            "media/size does not exactly match the selected image. "
-                            "Refusing to skip or create a duplicate.");
-
-                std::cout
-                        << "PS2 HDD Writer: GAME SKIPPED EXISTING SIZE MATCH\t"
-                        << bank
-                        << "\t"
-                        << source.sizeKb
-                        << "\t"
-                        << cleanField(source.startup)
-                        << "\t"
-                        << cleanField(before->name)
-                        << "\n";
-
-                return 0;
-            }
-
             std::cout << "STAGE: Installing " << options.gameName << " as "
-                      << expectedMedia
-                      << " HDL game into Bank " << bank << "...\n"
-                      << std::flush;
-
-            std::cout
-                    << "STAGE: hdl_dump inject arguments pinned: startup="
-                    << (source.startup.empty()
-                        ? "<not reported>"
-                        : source.startup)
-                    << ", dma=*u4\n"
-                    << std::flush;
-
-            runHdlDumpInstall(
-                    options,
-                    source.startup);
-
-            std::cout << "STAGE: Verifying the completed game transaction "
-                      << "from a fresh Bank " << bank
-                      << " hdl_toc...\n" << std::flush;
-
-            const auto afterRecords =
-                    parseInstalledRecords(
-                        runHdlDumpToc(options, bank));
-
-            const HdlInstalledRecord *after =
-                    findInstalledIdentity(
-                        afterRecords,
-                        source,
-                        options.gameName);
-
-            if (!after || !exactDiscMatch(*after, source))
-                throw std::runtime_error(
-                        "HDL write returned successfully but the fresh hdl_toc "
-                        "did not contain the same disc identity with the exact "
-                        "source media/size.");
-
-            std::cout << "PS2 HDD Writer: GAME INSTALL SUCCESS: "
-                      << options.gameName << "\n";
+                      << (options.media == "cd" ? "CD" : "DVD") << " HDL game into Bank " << bank << "...\n" << std::flush;
+            runHdlDumpInstall(options);
+            std::cout << "STAGE: Re-reading HDL game table in Bank " << bank << "...\n" << std::flush;
+            const std::string toc = runHdlDumpToc(options, bank);
+            if (toc.find(options.gameName) == std::string::npos)
+                throw std::runtime_error("HDL install completed but the new game was not found in hdl_toc verification.");
+            std::cout << "PS2 HDD Writer: GAME INSTALL SUCCESS: " << options.gameName << "\n";
             return 0;
         }
         if (!options.smokeImage.empty())

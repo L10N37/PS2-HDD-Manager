@@ -373,11 +373,12 @@ void testProvisionPfsshellScripts()
     selection.installFhdb = true;
     selection.installHddBootEnabler = true;
     selection.installMemoryCardAnnihilator = true;
+    selection.installFceumm = true;
     selection.configureOplPlugAndPlay = true;
 
     const std::string script = Ps2::Ps2HddFormat::BuildProvisionScript(
             "/dev/sdz", "/tmp/stage", selection);
-    TEST_CHECK(script.find("mkpart PP.FHDB.APPS 128M PFS\n") != std::string::npos);
+    TEST_CHECK(script.find("mkpart PP.FHDB.APPS 4096M PFS\n") != std::string::npos);
     TEST_CHECK(script.find("mount __common\nmkdir OPL\n") != std::string::npos);
     TEST_CHECK(script.find("put conf_hdd.cfg\n") != std::string::npos);
     TEST_CHECK(script.find("put OPNPS2LD.ELF\n") != std::string::npos);
@@ -386,6 +387,9 @@ void testProvisionPfsshellScripts()
     TEST_CHECK(script.find("put FHDB_BOOT_CONFIG.ELF\n") != std::string::npos);
     TEST_CHECK(script.find("mkdir Memory-Card-Annihilator\n") != std::string::npos);
     TEST_CHECK(script.find("put MCA_BOOT.ELF\n") != std::string::npos);
+    TEST_CHECK(script.find("mkdir FCEUmm-PS2-SMB\n") != std::string::npos);
+    TEST_CHECK(script.find("mkdir NES\n") != std::string::npos);
+    TEST_CHECK(script.find("put FCEUltra.cnf\n") != std::string::npos);
     TEST_CHECK(script.find("put conf_opl.cfg\n") != std::string::npos);
     TEST_CHECK(script.find("mount __system\n") != std::string::npos);
     TEST_CHECK(script.find("rename FHDB.XLF osdmain.elf\n") != std::string::npos);
@@ -435,6 +439,288 @@ void testGamesOnlyBankInitializer()
     try { Ps2::ApaBank::InitializeGamesOnly(imagePath, imageSize, 1, false); }
     catch (const std::runtime_error &) { refusedOverwrite = true; }
     TEST_CHECK(refusedOverwrite);
+}
+
+
+void testLargeApaPartitionChainAndSpaceAccounting()
+{
+    char imagePath[] =
+            "/tmp/ps2-hdd-large-apa-chain-XXXXXX";
+
+    const int descriptor =
+            mkstemp(imagePath);
+
+    TEST_CHECK(descriptor >= 0);
+
+    TemporaryProbeFile image(
+            descriptor,
+            imagePath);
+
+    constexpr std::uint32_t step =
+            Ps2::Apa::AllocationChunkSectors;
+
+    constexpr std::uint32_t headerCount =
+            1024;
+
+    const std::uint64_t sectors =
+            static_cast<std::uint64_t>(step) *
+            (headerCount + 16ULL);
+
+    TEST_CHECK(
+            ftruncate(
+                descriptor,
+                static_cast<off_t>(
+                    sectors * 512ULL)) == 0);
+
+    auto mbr = makeMbr();
+
+    writeLe32(
+            mbr.data() + 8,
+            step);
+
+    writeLe32(
+            mbr.data(),
+            0);
+
+    writeLe32(
+            mbr.data(),
+            Ps2::Apa::CalculateChecksum(
+                mbr.data(),
+                mbr.size()));
+
+    TEST_CHECK(
+            pwrite(
+                descriptor,
+                mbr.data(),
+                mbr.size(),
+                0) ==
+            static_cast<ssize_t>(
+                mbr.size()));
+
+    for (std::uint32_t i = 1;
+            i < headerCount;
+            ++i)
+    {
+        const std::uint32_t start =
+                step * i;
+
+        const std::uint32_t next =
+                i + 1 == headerCount
+                    ? 0
+                    : step * (i + 1);
+
+        const std::string name =
+                "PP.STRESS." +
+                std::to_string(i);
+
+        const auto header =
+                makePartition(
+                    name.c_str(),
+                    start,
+                    step,
+                    next);
+
+        TEST_CHECK(
+                pwrite(
+                    descriptor,
+                    header.data(),
+                    header.size(),
+                    static_cast<off_t>(
+                        static_cast<std::uint64_t>(
+                            start) *
+                        512ULL)) ==
+                static_cast<ssize_t>(
+                    header.size()));
+    }
+
+    TEST_CHECK(
+            image.closeFile() == 0);
+
+    const auto chain =
+            Ps2::Apa::ReadPartitionChain(
+                imagePath,
+                0,
+                sectors,
+                0);
+
+    TEST_CHECK(
+            chain.size() ==
+            headerCount);
+
+    const auto space =
+            Ps2::Apa::MeasureBankSpace(
+                imagePath,
+                0,
+                sectors);
+
+    TEST_CHECK(
+            space.usedChunks ==
+            headerCount);
+
+    TEST_CHECK(
+            space.freeChunks ==
+            16);
+
+    const auto small =
+            Ps2::Apa::EstimateHdlAllocation(
+                imagePath,
+                0,
+                sectors,
+                64ULL *
+                    1024ULL *
+                    1024ULL);
+
+    TEST_CHECK(small.fits);
+    TEST_CHECK(
+            small.requiredChunks >= 1);
+
+    const auto huge =
+            Ps2::Apa::EstimateHdlAllocation(
+                imagePath,
+                0,
+                sectors,
+                4ULL *
+                    1024ULL *
+                    1024ULL *
+                    1024ULL);
+
+    TEST_CHECK(!huge.fits);
+}
+
+void testLargeApaUpperBankChain()
+{
+    char imagePath[] =
+            "/tmp/ps2-hdd-large-upper-bank-XXXXXX";
+
+    const int descriptor =
+            mkstemp(imagePath);
+
+    TEST_CHECK(descriptor >= 0);
+
+    TemporaryProbeFile image(
+            descriptor,
+            imagePath);
+
+    constexpr std::uint32_t step =
+            Ps2::Apa::AllocationChunkSectors;
+
+    constexpr std::uint32_t headerCount =
+            1024;
+
+    const std::uint64_t bankBase =
+            Ps2::HddLayoutPlanner::BankBoundarySectors;
+
+    const std::uint64_t bankSectors =
+            static_cast<std::uint64_t>(step) *
+            (headerCount + 16ULL);
+
+    const std::uint64_t imageSectors =
+            bankBase + bankSectors;
+
+    TEST_CHECK(
+            ftruncate(
+                descriptor,
+                static_cast<off_t>(
+                    imageSectors * 512ULL)) == 0);
+
+    auto mbr = makeMbr();
+
+    writeLe32(
+            mbr.data() + 8,
+            step);
+
+    writeLe32(
+            mbr.data(),
+            0);
+
+    writeLe32(
+            mbr.data(),
+            Ps2::Apa::CalculateChecksum(
+                mbr.data(),
+                mbr.size()));
+
+    TEST_CHECK(
+            pwrite(
+                descriptor,
+                mbr.data(),
+                mbr.size(),
+                static_cast<off_t>(
+                    bankBase * 512ULL)) ==
+            static_cast<ssize_t>(
+                mbr.size()));
+
+    for (std::uint32_t i = 1;
+            i < headerCount;
+            ++i)
+    {
+        const std::uint32_t start =
+                step * i;
+
+        const std::uint32_t next =
+                i + 1 == headerCount
+                    ? 0
+                    : step * (i + 1);
+
+        const std::string name =
+                "PP.BANK1." +
+                std::to_string(i);
+
+        const auto header =
+                makePartition(
+                    name.c_str(),
+                    start,
+                    step,
+                    next);
+
+        TEST_CHECK(
+                pwrite(
+                    descriptor,
+                    header.data(),
+                    header.size(),
+                    static_cast<off_t>(
+                        (bankBase +
+                         static_cast<std::uint64_t>(
+                            start)) *
+                        512ULL)) ==
+                static_cast<ssize_t>(
+                    header.size()));
+    }
+
+    TEST_CHECK(
+            image.closeFile() == 0);
+
+    const auto chain =
+            Ps2::Apa::ReadPartitionChain(
+                imagePath,
+                bankBase,
+                bankSectors,
+                0);
+
+    TEST_CHECK(
+            chain.size() ==
+            headerCount);
+
+    TEST_CHECK(
+            chain.front().physicalSector ==
+            bankBase);
+
+    TEST_CHECK(
+            chain.back().physicalSector >
+            Ps2::HddLayoutPlanner::BankBoundarySectors);
+
+    const auto space =
+            Ps2::Apa::MeasureBankSpace(
+                imagePath,
+                bankBase,
+                bankSectors);
+
+    TEST_CHECK(
+            space.usedChunks ==
+            headerCount);
+
+    TEST_CHECK(
+            space.freeChunks ==
+            16);
 }
 
 void testApaPartitionChainReader()
@@ -496,6 +782,8 @@ int main()
     testStandardPfsshellScripts();
     testProvisionPfsshellScripts();
     testApaPartitionChainReader();
+    testLargeApaPartitionChainAndSpaceAccounting();
+    testLargeApaUpperBankChain();
     testGamesOnlyBankInitializer();
 #endif
     std::cout << "PS2 APA, layout, standard-format and FHDB configuration tests passed.\n";
