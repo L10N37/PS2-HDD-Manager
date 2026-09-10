@@ -3010,6 +3010,7 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
         QString renameDestination;
         int bank = 0;
         qulonglong bytes = 0;
+        qulonglong sourceKb = 0;
     };
 
     const bool renameFromDatabase =
@@ -3117,6 +3118,9 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
         }
 
         QString gameId;
+        qulonglong sourceKb = 0;
+        bool sourceSizeOk = false;
+
         for (const QString &line : probe.split('\n', Qt::SkipEmptyParts)) {
             const QStringList fields = line.trimmed().split(';');
             if (fields.size() < 4)
@@ -3130,7 +3134,28 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
                 continue;
 
             gameId = cleanMachineField(fields[3]).toUpper();
-            break;
+
+            QString sizeField =
+                    cleanMachineField(fields[1]);
+            if (sizeField.endsWith(
+                        "KB",
+                        Qt::CaseInsensitive))
+                sizeField.chop(2);
+
+            sourceKb =
+                    sizeField.trimmed()
+                        .toULongLong(&sourceSizeOk);
+
+            if (sourceSizeOk && sourceKb > 0)
+                break;
+        }
+
+        if (!sourceSizeOk || sourceKb == 0) {
+            if (error)
+                *error =
+                    "Could not preserve exact cdvd_info2 source size for "
+                    "the transfer queue cache.";
+            return false;
         }
 
         QString name = info.completeBaseName().trimmed();
@@ -3173,6 +3198,7 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
         out->renameDestination = renameDestination;
         out->bank = bank;
         out->bytes = static_cast<qulonglong>(info.size());
+        out->sourceKb = sourceKb;
         return !out->key.isEmpty();
     };
 
@@ -3463,6 +3489,146 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
         return false;
     };
 
+    // PS2_HDD_QUEUE_EXISTING_CACHE_V1
+    // Cache every installed HDL identity once at queue start.  The old hot
+    // loop launched --check-existing-game for each source image, causing a
+    // complete all-bank hdl_toc rescan hundreds of times on large disks.
+    std::vector<ExistingCheck> queueInstalledCache;
+
+    {
+        statusLabel->setText(
+                "Caching installed HDL identities once for this transfer queue...");
+        QApplication::processEvents();
+
+        QString cacheOutput;
+        const bool cacheOk =
+                runPrivilegedWriter(
+                    disk,
+                    {
+                        "--hdl-dump",
+                        hdlDumpPath,
+                        "--list-games"
+                    },
+                    &cacheOutput);
+
+        if (!cacheOk) {
+            transferQueueRunning = false;
+
+            if (diskCombo)
+                diskCombo->setEnabled(true);
+            if (ps2View)
+                ps2View->setEnabled(true);
+            if (addArtButton)
+                addArtButton->setEnabled(true);
+            if (installAppsButton)
+                installAppsButton->setEnabled(true);
+            if (applyOplDefaultsButton)
+                applyOplDefaultsButton->setEnabled(true);
+            updateUnlockUi();
+            copyToPs2Button->setEnabled(
+                    selectedDiskCanInstallGames());
+
+            QMessageBox::critical(
+                    this,
+                    "Could not cache installed games",
+                    "The transfer queue was not started because the initial "
+                    "read-only HDL game scan failed:\n\n" +
+                    cacheOutput.right(5000));
+            return;
+        }
+
+        for (const QString &line :
+                cacheOutput.split(
+                    '\n',
+                    Qt::SkipEmptyParts)) {
+            if (!line.startsWith("GAME\t"))
+                continue;
+
+            const QStringList fields =
+                    line.split('\t');
+
+            if (fields.size() < 6)
+                continue;
+
+            bool bankOk = false;
+            bool sizeOk = false;
+
+            ExistingCheck cached;
+            cached.bank =
+                    cleanMachineField(
+                        fields[1]).toInt(&bankOk);
+            cached.media =
+                    cleanMachineField(
+                        fields[2]).toUpper();
+            cached.installedKb =
+                    cleanMachineField(
+                        fields[3]).toULongLong(&sizeOk);
+            cached.sourceKb = cached.installedKb;
+            cached.startup =
+                    cleanMachineField(
+                        fields[4]).toUpper();
+            cached.installedName =
+                    cleanMachineField(
+                        fields.mid(5).join(" "));
+
+            if (bankOk && sizeOk)
+                queueInstalledCache.push_back(
+                        std::move(cached));
+        }
+
+        statusLabel->setText(
+                QString("Cached %1 installed HDL game(s); "
+                        "per-game all-bank rescans disabled.")
+                    .arg(
+                        static_cast<qulonglong>(
+                            queueInstalledCache.size())));
+        QApplication::processEvents();
+    }
+
+    auto checkExistingFromQueueCache =
+            [&](const Game &game,
+                    ExistingCheck *result) -> bool {
+        ExistingCheck parsed;
+        parsed.state = ExistingState::Absent;
+        parsed.sourceKb = game.sourceKb;
+        parsed.media = game.media.toUpper();
+        parsed.startup = game.gameId.toUpper();
+
+        for (const ExistingCheck &cached :
+                queueInstalledCache) {
+            const bool sameIdentity =
+                    !game.gameId.isEmpty()
+                        ? cached.startup.compare(
+                            game.gameId,
+                            Qt::CaseInsensitive) == 0
+                        : cached.installedName ==
+                            game.name;
+
+            if (!sameIdentity)
+                continue;
+
+            parsed = cached;
+            parsed.sourceKb = game.sourceKb;
+
+            parsed.state =
+                    cached.media.compare(
+                        game.media,
+                        Qt::CaseInsensitive) == 0 &&
+                    cached.installedKb ==
+                        game.sourceKb
+                        ? ExistingState::Match
+                        : ExistingState::Mismatch;
+
+            if (result)
+                *result = parsed;
+            return true;
+        }
+
+        if (result)
+            *result = parsed;
+        return true;
+    };
+
     struct BankFit
     {
         bool fits = false;
@@ -3669,22 +3835,20 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
 
         statusLabel->setText(
                 QString(
-                    "Checking HDD for an existing size-matched copy of %1...")
+                    "Checking cached HDD identities for %1...")
                     .arg(game.name));
         QApplication::processEvents();
 
         ExistingCheck existing;
         QString existingError;
 
-        if (!checkExistingGame(
+        if (!checkExistingFromQueueCache(
                     game,
-                    &existing,
-                    &existingError)) {
+                    &existing)) {
             queueAborted = true;
             queueAbortReason =
                     game.name +
-                    " — existing-game verification failed before any write:\n" +
-                    existingError.right(2200).trimmed();
+                    " — queue-cache verification failed before any write.";
             failedResults <<
                     queueAbortReason;
             break;
@@ -3878,6 +4042,42 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
                     prefix);
 
         if (installed) {
+            // PS2_HDD_QUEUE_EXISTING_CACHE_V1
+            // Writer-side preflight/check and post-write verification remain
+            // authoritative.  Mirror the committed identity into the queue
+            // cache so later live-queued entries cannot duplicate it.
+            bool cacheAlreadyHasIdentity = false;
+
+            for (const ExistingCheck &cached :
+                    queueInstalledCache) {
+                const bool sameIdentity =
+                        !game.gameId.isEmpty()
+                            ? cached.startup.compare(
+                                game.gameId,
+                                Qt::CaseInsensitive) == 0
+                            : cached.installedName ==
+                                game.name;
+
+                if (sameIdentity) {
+                    cacheAlreadyHasIdentity = true;
+                    break;
+                }
+            }
+
+            if (!cacheAlreadyHasIdentity) {
+                ExistingCheck cached;
+                cached.state = ExistingState::Match;
+                cached.bank = game.bank;
+                cached.installedKb = game.sourceKb;
+                cached.sourceKb = game.sourceKb;
+                cached.media = game.media.toUpper();
+                cached.startup = game.gameId.toUpper();
+                cached.installedName = game.name;
+
+                queueInstalledCache.push_back(
+                        std::move(cached));
+            }
+
             if (output.contains(
                         "GAME SKIPPED EXISTING SIZE MATCH")) {
                 skippedExistingResults <<
