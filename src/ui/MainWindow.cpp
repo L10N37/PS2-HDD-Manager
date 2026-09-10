@@ -19,6 +19,7 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QEventLoop>
+#include <QElapsedTimer>
 #include <QDir>
 #include <QDirIterator>
 #include <QDragEnterEvent>
@@ -3618,6 +3619,10 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
         totalBytes += game.bytes;
 
     qulonglong completedBytes = 0;
+    qulonglong newlyInstalledBytes = 0;
+
+    QElapsedTimer queueTimer;
+    queueTimer.start();
 
     transferQueueRunning = true;
 
@@ -4065,6 +4070,160 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
                     bankPlan.banks.size())
                 : 0;
 
+    // PS2_HDD_AUTO_SPACE_CACHE_V1
+    //
+    // For a fresh/sequential APA bank, all remaining free chunks normally form
+    // one contiguous tail. The first AUTO query remains a real native-APA
+    // measurement. If free == largestFreeRun, later queue entries are decided
+    // from RAM. Fragmented banks deliberately retain the old live query path.
+    struct QueueBankSpaceState
+    {
+        bool initialized = false;
+        bool contiguousTail = false;
+        BankFit fit;
+    };
+
+    std::vector<QueueBankSpaceState>
+            queueBankSpace(
+                bankCount > 0
+                    ? static_cast<std::size_t>(
+                        bankCount)
+                    : 0U);
+
+    auto contiguousRequiredChunks =
+            [](qulonglong bytes) -> int {
+        constexpr qulonglong MiB =
+                1024ULL * 1024ULL;
+
+        if (bytes == 0)
+            return 0;
+
+        const qulonglong imageMiB =
+                (bytes + MiB - 1ULL) /
+                MiB;
+
+        const qulonglong required =
+                (imageMiB + 4ULL + 127ULL) /
+                128ULL;
+
+        if (required >
+                static_cast<qulonglong>(
+                    std::numeric_limits<int>::max()))
+            return -1;
+
+        return static_cast<int>(
+                required);
+    };
+
+    auto queryQueueBankFit =
+            [&](int bank,
+                    qulonglong bytes,
+                    BankFit *fit,
+                    QString *error) -> bool {
+        if (bank < 0 ||
+                bank >= bankCount) {
+            if (error)
+                *error =
+                        "AUTO queue requested an invalid bank.";
+            return false;
+        }
+
+        QueueBankSpaceState &state =
+                queueBankSpace[
+                    static_cast<std::size_t>(
+                        bank)];
+
+        if (!state.initialized) {
+            BankFit live;
+
+            if (!queryBankFit(
+                        bank,
+                        bytes,
+                        &live,
+                        error))
+                return false;
+
+            state.initialized = true;
+            state.fit = live;
+            state.contiguousTail =
+                    live.free ==
+                    live.largest;
+
+            if (fit)
+                *fit = live;
+
+            return true;
+        }
+
+        if (!state.contiguousTail)
+            return queryBankFit(
+                    bank,
+                    bytes,
+                    fit,
+                    error);
+
+        const int required =
+                contiguousRequiredChunks(
+                    bytes);
+
+        if (required <= 0) {
+            if (error)
+                *error =
+                        "Could not calculate AUTO queue allocation chunks.";
+            return false;
+        }
+
+        BankFit cached =
+                state.fit;
+        cached.required = required;
+        cached.runs =
+                required > 0 ? 1 : 0;
+        cached.fits =
+                required <=
+                cached.free;
+
+        if (fit)
+            *fit = cached;
+
+        return true;
+    };
+
+    auto noteCommittedQueueSpace =
+            [&](int bank,
+                    qulonglong bytes) {
+        if (bank < 0 ||
+                bank >= bankCount)
+            return;
+
+        QueueBankSpaceState &state =
+                queueBankSpace[
+                    static_cast<std::size_t>(
+                        bank)];
+
+        if (!state.initialized ||
+                !state.contiguousTail)
+            return;
+
+        const int required =
+                contiguousRequiredChunks(
+                    bytes);
+
+        if (required <= 0 ||
+                required > state.fit.free) {
+            state.contiguousTail = false;
+            return;
+        }
+
+        state.fit.used += required;
+        state.fit.free -= required;
+        state.fit.largest =
+                state.fit.free;
+        state.fit.required = 0;
+        state.fit.runs = 0;
+        state.fit.fits =
+                state.fit.free > 0;
+    };
+
     int autoFloorBank = 0;
     bool queueAborted = false;
     QString queueAbortReason;
@@ -4277,7 +4436,7 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
 
                 QApplication::processEvents();
 
-                if (!queryBankFit(
+                if (!queryQueueBankFit(
                             bank,
                             game.bytes,
                             &fit,
@@ -4435,6 +4594,13 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
                         .arg(game.name)
                         .arg(game.media.toUpper())
                         .arg(game.bank);
+
+                newlyInstalledBytes +=
+                        game.bytes;
+
+                noteCommittedQueueSpace(
+                        game.bank,
+                        game.bytes);
             }
 
             renameProcessedSource(game);
@@ -4530,6 +4696,41 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
                         games.size()))
                 .arg(installedResults.size())
                 .arg(skippedExistingResults.size());
+
+    const qint64 queueElapsedMs =
+            queueTimer.elapsed();
+
+    const double aggregateMiBs =
+            queueElapsedMs > 0 &&
+                    newlyInstalledBytes > 0
+                ? (static_cast<double>(
+                       newlyInstalledBytes) /
+                   (1024.0 * 1024.0)) /
+                  (static_cast<double>(
+                       queueElapsedMs) /
+                   1000.0)
+                : 0.0;
+
+    summary +=
+            QString(
+                "\nQueue elapsed: %1 s"
+                "\nNew-install payload: %2"
+                "\nEnd-to-end aggregate rate: %3 MiB/s")
+                .arg(
+                    static_cast<double>(
+                        queueElapsedMs) /
+                        1000.0,
+                    0,
+                    'f',
+                    1)
+                .arg(
+                    formatBytes(
+                        newlyInstalledBytes))
+                .arg(
+                    aggregateMiBs,
+                    0,
+                    'f',
+                    2);
 
     if (!installedResults.isEmpty())
         summary +=

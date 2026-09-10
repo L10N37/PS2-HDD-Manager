@@ -2301,6 +2301,205 @@ void emitRawHdlGameRecords(
     }
 }
 
+// PS2_HDD_FAST_INSTALL_TARGETED_VERIFY_V1
+// Fast install verification for populated banks.
+//
+// hdl_dump's hdl_toc path rereads every installed HDL game header. That is
+// appropriate for a complete listing, but unnecessarily expensive when an
+// install transaction only needs to answer whether THIS startup ID exists.
+//
+// APA IDs preserve the startup ID in PP.XXXX-xxxxx.. form. We walk the
+// validated APA chain, filter by that startup stem, and read only the matching
+// 0x101000 HDL header. The raw-size calculation deliberately mirrors hdl_dump
+// hdl_ginfo_read(): count byte at 0xF0, entries at 0xF5, size word +2, sum/4.
+struct TargetedRawHdlLookup
+{
+    int matches = 0;
+    HdlInstalledRecord record;
+};
+
+std::string fastApaStartupStem(
+        const std::string &startup)
+{
+    if (startup.size() < 11 ||
+            startup[4] != '_' ||
+            startup[8] != '.')
+        return {};
+
+    std::string result =
+            startup.substr(0, 4) +
+            "-" +
+            startup.substr(5, 3) +
+            startup.substr(9, 2);
+
+    return fastUpperAscii(
+            std::move(result));
+}
+
+TargetedRawHdlLookup readTargetedRawHdlByStartup(
+        const Options &options,
+        int bank,
+        const std::string &startup)
+{
+    const std::string wantedStartup =
+            fastUpperAscii(startup);
+    const std::string wantedStem =
+            fastApaStartupStem(wantedStartup);
+
+    if (wantedStem.empty())
+        throw std::runtime_error(
+                "Targeted raw HDL verification received an invalid startup ID.");
+
+    const auto layout =
+            Ps2::HddLayoutPlanner::Plan(
+                options.expectedSize,
+                Ps2::HddLayoutMode::ExtendedApaBanks);
+
+    if (!layout.valid ||
+            bank < 0 ||
+            static_cast<std::size_t>(bank) >=
+                layout.banks.size())
+        throw std::runtime_error(
+                "Targeted raw HDL verification bank is outside the disk.");
+
+    const auto &bankLayout =
+            layout.banks[
+                static_cast<std::size_t>(bank)];
+
+    const auto partitions =
+            Ps2::Apa::ReadPartitionChain(
+                options.device,
+                bankLayout.baseSector,
+                bankLayout.addressableSectorCount,
+                0);
+
+    const int fd =
+            open(
+                options.device.c_str(),
+                O_RDONLY | O_CLOEXEC);
+
+    if (fd < 0)
+        throw std::runtime_error(
+                "Could not open selected HDD for targeted HDL verification: " +
+                std::string(std::strerror(errno)));
+
+    TargetedRawHdlLookup result;
+
+    try
+    {
+        constexpr std::uint64_t SectorBytes = 512;
+        constexpr std::uint64_t HdlHeaderOffsetSectors =
+                0x00101000ULL / SectorBytes;
+
+        for (const auto &partition : partitions)
+        {
+            if (partition.header.type != 0x1337 ||
+                    (partition.header.flags & 0x0001) != 0)
+                continue;
+
+            const std::string partitionId =
+                    fastUpperAscii(
+                        partition.header.id);
+
+            if (partitionId.size() < 13 ||
+                    partitionId.substr(3, 10) !=
+                        wantedStem)
+                continue;
+
+            std::array<unsigned char, 1024> header{};
+
+            fastReadExactAt(
+                fd,
+                (partition.physicalSector +
+                 HdlHeaderOffsetSectors) *
+                    SectorBytes,
+                header.data(),
+                header.size());
+
+            if (fastReadLe32(
+                        header.data()) !=
+                    0xdeadfeedU)
+                throw std::runtime_error(
+                        "Matching APA partition has invalid HDL header magic for " +
+                        startup + ".");
+
+            HdlInstalledRecord record;
+            record.name =
+                    fastBoundedString(
+                        header.data() + 0x08,
+                        0xa0);
+            record.startup =
+                    fastUpperAscii(
+                        fastBoundedString(
+                            header.data() + 0xac,
+                            12));
+            record.media =
+                    header[0x00ec] == 0x14
+                        ? "DVD"
+                        : "CD";
+
+            if (record.startup !=
+                    wantedStartup)
+                throw std::runtime_error(
+                        "APA partition startup stem and raw HDL startup ID disagree for " +
+                        startup + ".");
+
+            const std::size_t numParts =
+                    static_cast<std::size_t>(
+                        header[0x00f0]);
+
+            if (numParts == 0 ||
+                    numParts > 65)
+                throw std::runtime_error(
+                        "Invalid raw HDL allocation count while verifying " +
+                        startup + ".");
+
+            std::uint64_t rawSizeUnits = 0;
+
+            for (std::size_t i = 0;
+                    i < numParts;
+                    ++i)
+            {
+                const std::size_t lengthOffset =
+                        0x00f5 +
+                        i * 12 +
+                        8;
+
+                if (lengthOffset + 4 >
+                        header.size())
+                    throw std::runtime_error(
+                            "Raw HDL allocation table exceeds its header while verifying " +
+                            startup + ".");
+
+                rawSizeUnits +=
+                        fastReadLe32(
+                            header.data() +
+                            lengthOffset);
+            }
+
+            record.sizeKb =
+                    rawSizeUnits / 4ULL;
+
+            ++result.matches;
+
+            if (result.matches == 1)
+                result.record =
+                        std::move(record);
+        }
+
+        if (close(fd) != 0)
+            throw std::runtime_error(
+                    "Could not close selected HDD after targeted HDL verification.");
+    }
+    catch (...)
+    {
+        close(fd);
+        throw;
+    }
+
+    return result;
+}
+
 void emitGameRecords(const std::string &toc, int bank)
 {
     std::istringstream lines(toc);
@@ -3209,15 +3408,56 @@ int main(int argc, char **argv)
                       << " for the same startup ID/name and exact disc size...\n"
                       << std::flush;
 
-            const auto beforeRecords =
-                    parseInstalledRecords(
-                        runHdlDumpToc(options, bank));
-
+            std::vector<HdlInstalledRecord>
+                    legacyBeforeRecords;
+            TargetedRawHdlLookup fastBefore;
             const HdlInstalledRecord *before =
-                    findInstalledIdentity(
-                        beforeRecords,
-                        source,
-                        options.gameName);
+                    nullptr;
+
+            const std::string fastStartupStem =
+                    fastApaStartupStem(
+                        source.startup);
+
+            if (!fastStartupStem.empty())
+            {
+                fastBefore =
+                        readTargetedRawHdlByStartup(
+                            options,
+                            bank,
+                            source.startup);
+
+                if (fastBefore.matches > 1)
+                    throw std::runtime_error(
+                            "Multiple installed HDL partitions share startup ID " +
+                            source.startup +
+                            "; refusing an ambiguous install.");
+
+                if (fastBefore.matches == 1)
+                    before =
+                            &fastBefore.record;
+
+                std::cout
+                        << "FAST_INSTALL_VERIFY\tPRE\t"
+                        << bank << "\t"
+                        << fastBefore.matches << "\t"
+                        << cleanField(source.startup)
+                        << "\n"
+                        << std::flush;
+            }
+            else
+            {
+                legacyBeforeRecords =
+                        parseInstalledRecords(
+                            runHdlDumpToc(
+                                options,
+                                bank));
+
+                before =
+                        findInstalledIdentity(
+                            legacyBeforeRecords,
+                            source,
+                            options.gameName);
+            }
 
             if (before)
             {
@@ -3258,25 +3498,65 @@ int main(int argc, char **argv)
                     options,
                     source.startup);
 
-            std::cout << "STAGE: Verifying the completed game transaction "
-                      << "from a fresh Bank " << bank
-                      << " hdl_toc...\n" << std::flush;
+            std::cout
+                    << "STAGE: Targeted raw post-write verification on Bank "
+                    << bank << "...\n"
+                    << std::flush;
 
-            const auto afterRecords =
-                    parseInstalledRecords(
-                        runHdlDumpToc(options, bank));
-
+            std::vector<HdlInstalledRecord>
+                    legacyAfterRecords;
+            TargetedRawHdlLookup fastAfter;
             const HdlInstalledRecord *after =
-                    findInstalledIdentity(
-                        afterRecords,
-                        source,
-                        options.gameName);
+                    nullptr;
 
-            if (!after || !exactDiscMatch(*after, source))
+            if (!fastStartupStem.empty())
+            {
+                fastAfter =
+                        readTargetedRawHdlByStartup(
+                            options,
+                            bank,
+                            source.startup);
+
+                if (fastAfter.matches != 1)
+                    throw std::runtime_error(
+                            "Targeted post-write verification expected exactly one "
+                            "installed partition for " +
+                            source.startup + ".");
+
+                after =
+                        &fastAfter.record;
+
+                std::cout
+                        << "FAST_INSTALL_VERIFY\tPOST\t"
+                        << bank << "\t"
+                        << fastAfter.matches << "\t"
+                        << cleanField(source.startup)
+                        << "\n"
+                        << std::flush;
+            }
+            else
+            {
+                legacyAfterRecords =
+                        parseInstalledRecords(
+                            runHdlDumpToc(
+                                options,
+                                bank));
+
+                after =
+                        findInstalledIdentity(
+                            legacyAfterRecords,
+                            source,
+                            options.gameName);
+            }
+
+            if (!after ||
+                    !exactDiscMatch(
+                        *after,
+                        source))
                 throw std::runtime_error(
-                        "HDL write returned successfully but the fresh hdl_toc "
-                        "did not contain the same disc identity with the exact "
-                        "source media/size.");
+                        "HDL write returned successfully but targeted/raw "
+                        "post-write verification did not contain the same "
+                        "disc identity with the exact source media/size.");
 
             std::cout << "PS2 HDD Writer: GAME INSTALL SUCCESS: "
                       << options.gameName << "\n";
