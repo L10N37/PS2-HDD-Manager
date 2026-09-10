@@ -67,6 +67,7 @@ private:
     void renameInstalledGamesFromLatestDatabase(bool allInstalled);
     bool renameInstalledGameOnHdd(const InstalledGameRef &game,
             const QString &newName, QString *error);
+    bool invalidateOplHddGameListCache(QString *error);
     bool fetchLatestGameTitleDatabase(QHash<QString, QString> *titles,
             QString *error);
     void toggleMarkedPcPath(const QModelIndex &index);

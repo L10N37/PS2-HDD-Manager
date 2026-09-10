@@ -74,6 +74,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <limits>
 
 #ifdef __linux__
 #include <unistd.h>
@@ -260,80 +261,223 @@ private:
     const QSet<QString> *marked;
 };
 
-// PS2_HDD_LEFT_ISO_GAME_ID_V3
+// PS2_HDD_LEFT_GAME_ID_FOLDER_FAST_V4
+quint32 readIsoLe32(const QByteArray &bytes, qsizetype offset)
+{
+    if (offset < 0 || offset + 4 > bytes.size())
+        return 0;
+
+    const auto *p = reinterpret_cast<const unsigned char *>(
+            bytes.constData() + offset);
+
+    return static_cast<quint32>(p[0]) |
+            (static_cast<quint32>(p[1]) << 8U) |
+            (static_cast<quint32>(p[2]) << 16U) |
+            (static_cast<quint32>(p[3]) << 24U);
+}
+
+QString parsePs2SystemCnfGameId(const QByteArray &systemCnf)
+{
+    // PS2 discs use BOOT2. Requiring BOOT2 rather than BOOT keeps ordinary
+    // ISO9660 images and PS1 discs from being misidentified.
+    static const QRegularExpression boot2(
+            QStringLiteral(
+                "^\\s*BOOT2\\s*=\\s*cdrom0:\\\\+"
+                "([A-Z]{4}_[0-9]{3}\\.[0-9]{2})(?:;1)?"),
+            QRegularExpression::CaseInsensitiveOption |
+            QRegularExpression::MultilineOption);
+
+    const QRegularExpressionMatch match =
+            boot2.match(QString::fromLatin1(systemCnf));
+
+    return match.hasMatch()
+            ? match.captured(1).toUpper()
+            : QString();
+}
+
 QString identifyIsoGameIdFast(const QString &path)
 {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly))
         return QString();
 
+    // Reject tiny/random files before doing any ISO work.
+    if (file.size() < (17LL * 2048LL))
+        return QString();
+
     auto readAt = [&](quint64 offset, qsizetype amount) -> QByteArray {
+        if (offset > static_cast<quint64>(
+                    std::numeric_limits<qint64>::max()))
+            return {};
+
         if (!file.seek(static_cast<qint64>(offset)))
             return {};
+
         const QByteArray bytes = file.read(amount);
         return bytes.size() == amount ? bytes : QByteArray();
     };
 
-    const QByteArray rootLocation = readAt(0x80A4ULL, 2);
-    if (rootLocation.size() != 2)
+    // Cheap ISO9660 sanity check: one 2048-byte PVD read.
+    const QByteArray pvd = readAt(16ULL * 2048ULL, 2048);
+    if (pvd.size() != 2048 ||
+            static_cast<unsigned char>(pvd[0]) != 1U ||
+            pvd.mid(1, 5) != QByteArrayLiteral("CD001") ||
+            static_cast<unsigned char>(pvd[6]) != 1U)
         return QString();
 
-    const quint32 rootSector =
-            (static_cast<quint32>(
-                static_cast<unsigned char>(rootLocation[0])) << 8U) |
-            static_cast<quint32>(
-                static_cast<unsigned char>(rootLocation[1]));
+    const quint16 logicalBlockSize =
+            static_cast<quint16>(
+                static_cast<unsigned char>(pvd[128])) |
+            (static_cast<quint16>(
+                static_cast<unsigned char>(pvd[129])) << 8U);
 
-    const quint64 rootOffset =
-            static_cast<quint64>(rootSector) * 2048ULL;
-
-    const QByteArray root = readAt(rootOffset, 2048);
-    if (root.size() != 2048)
+    if (logicalBlockSize != 2048U)
         return QString();
 
-    const QByteArray systemCnfName("EM.CNF", 6);
-    const qsizetype cnfIndex = root.indexOf(systemCnfName);
-    if (cnfIndex < 31)
+    // ISO9660 root directory record lives in the PVD at byte 156.
+    const quint32 rootSector = readIsoLe32(pvd, 156 + 2);
+    const quint32 rootBytes = readIsoLe32(pvd, 156 + 10);
+    if (rootSector == 0 || rootBytes == 0)
         return QString();
 
-    const qsizetype extent = cnfIndex - 31;
-    if (extent < 0 || extent + 4 > root.size())
+    // No huge negative scans: cap root-directory inspection at 64 KiB.
+    const quint32 rootReadBytes =
+            std::min<quint32>(rootBytes, 64U * 1024U);
+
+    const QByteArray root = readAt(
+            static_cast<quint64>(rootSector) * 2048ULL,
+            static_cast<qsizetype>(rootReadBytes));
+    if (root.isEmpty())
         return QString();
 
-    const quint32 systemSector =
-            (static_cast<quint32>(
-                static_cast<unsigned char>(root[extent])) << 24U) |
-            (static_cast<quint32>(
-                static_cast<unsigned char>(root[extent + 1])) << 16U) |
-            (static_cast<quint32>(
-                static_cast<unsigned char>(root[extent + 2])) << 8U) |
-            static_cast<quint32>(
-                static_cast<unsigned char>(root[extent + 3]));
+    qsizetype pos = 0;
+    while (pos < root.size()) {
+        const quint8 recordLength =
+                static_cast<quint8>(
+                    static_cast<unsigned char>(root[pos]));
 
-    const quint64 systemOffset =
-            static_cast<quint64>(systemSector) * 2048ULL;
+        if (recordLength == 0) {
+            // ISO9660 pads the rest of a directory sector with zeroes.
+            const qsizetype nextSector =
+                    ((pos / 2048) + 1) * 2048;
+            if (nextSector <= pos)
+                break;
+            pos = nextSector;
+            continue;
+        }
 
-    const QByteArray systemCnf = readAt(systemOffset, 64);
-    if (systemCnf.size() != 64)
-        return QString();
+        if (recordLength < 34 ||
+                pos + recordLength > root.size())
+            break;
 
-    const QByteArray precursor = QByteArray::fromHex("303A5C"); // bytes 30 3A 5C = 0 colon backslash
-    const qsizetype precursorIndex = systemCnf.indexOf(precursor);
-    if (precursorIndex < 0 ||
-            precursorIndex + 3 + 11 > systemCnf.size())
-        return QString();
+        const quint8 nameLength =
+                static_cast<quint8>(
+                    static_cast<unsigned char>(root[pos + 32]));
 
-    const QByteArray idBytes =
-            systemCnf.mid(precursorIndex + 3, 11);
+        if (33 + nameLength <= recordLength) {
+            QByteArray name =
+                    root.mid(pos + 33, nameLength);
 
-    for (const char ch : idBytes) {
-        const unsigned char value =
-                static_cast<unsigned char>(ch);
-        if (value < 0x20 || value > 0x7e)
-            return QString();
+            const int versionSeparator = name.indexOf(';');
+            if (versionSeparator >= 0)
+                name.truncate(versionSeparator);
+
+            if (name.compare(
+                        QByteArrayLiteral("SYSTEM.CNF"),
+                        Qt::CaseInsensitive) == 0) {
+                const quint32 systemSector =
+                        readIsoLe32(root, pos + 2);
+                const quint32 systemBytes =
+                        readIsoLe32(root, pos + 10);
+
+                if (systemSector == 0 || systemBytes == 0)
+                    return QString();
+
+                const quint32 cnfReadBytes =
+                        std::min<quint32>(
+                            systemBytes,
+                            4096U);
+
+                const QByteArray systemCnf = readAt(
+                        static_cast<quint64>(systemSector) * 2048ULL,
+                        static_cast<qsizetype>(cnfReadBytes));
+
+                return parsePs2SystemCnfGameId(systemCnf);
+            }
+        }
+
+        pos += recordLength;
     }
 
-    return QString::fromLatin1(idBytes).toUpper();
+    return QString();
+}
+
+QString identifyFolderGameIdFast(const QString &path)
+{
+    const QDir dir(path);
+
+    // Extracted-disc folder: check the normal root SYSTEM.CNF names only.
+    // This is deliberately not recursive.
+    const QStringList cnfNames = {
+        QStringLiteral("SYSTEM.CNF"),
+        QStringLiteral("system.cnf"),
+        QStringLiteral("System.cnf"),
+        QStringLiteral("SYSTEM.CNF;1")
+    };
+
+    for (const QString &name : cnfNames) {
+        QFile cnf(dir.filePath(name));
+        if (!cnf.exists() || !cnf.open(QIODevice::ReadOnly))
+            continue;
+
+        const QString id =
+                parsePs2SystemCnfGameId(cnf.read(4096));
+        if (!id.isEmpty())
+            return id;
+    }
+
+    // Common collection layout: one ISO directly inside a game folder.
+    // Inspect at most 64 direct child files and never recurse.
+    QDirIterator it(
+            path,
+            QDir::Files | QDir::NoDotAndDotDot,
+            QDirIterator::NoIteratorFlags);
+
+    int examined = 0;
+    while (it.hasNext() && examined < 64) {
+        it.next();
+        ++examined;
+
+        const QFileInfo child = it.fileInfo();
+        if (child.suffix().compare(
+                    QStringLiteral("iso"),
+                    Qt::CaseInsensitive) != 0)
+            continue;
+
+        const QString id =
+                identifyIsoGameIdFast(
+                    child.absoluteFilePath());
+        if (!id.isEmpty())
+            return id;
+    }
+
+    return QString();
+}
+
+QString identifyPathGameIdFast(const QString &path)
+{
+    const QFileInfo info(path);
+
+    if (info.isDir())
+        return identifyFolderGameIdFast(path);
+
+    if (!info.isFile() ||
+            info.suffix().compare(
+                QStringLiteral("iso"),
+                Qt::CaseInsensitive) != 0)
+        return QString();
+
+    return identifyIsoGameIdFast(path);
 }
 
 class Ps2FileSystemModel final : public QFileSystemModel
@@ -379,17 +523,28 @@ public:
                 QDir::cleanPath(filePath(nameIndex));
         const QFileInfo info(path);
 
-        // Intentionally ISO only. OPL internal-HDD HDL games are not CHD.
-        if (!info.isFile() ||
-                info.suffix().compare(
-                    "iso",
-                    Qt::CaseInsensitive) != 0)
+        // Probe directories as well as ISO files. Directories are cheap:
+        // root SYSTEM.CNF first, then at most 64 direct child files looking
+        // for an ISO. There is deliberately no recursive scan.
+        const bool candidate =
+                info.isDir() ||
+                (info.isFile() &&
+                 info.suffix().compare(
+                     QStringLiteral("iso"),
+                     Qt::CaseInsensitive) == 0);
+
+        if (!candidate)
             return QVariant();
 
-        if (role == Qt::ToolTipRole)
+        if (role == Qt::ToolTipRole) {
+            if (info.isDir())
+                return QStringLiteral(
+                        "Fast PS2 Game ID probe: root SYSTEM.CNF or one "
+                        "direct child ISO only. No recursive folder scan.");
             return QStringLiteral(
-                    "PS2 Game ID read directly from this ISO. "
-                    "Only a few small ISO sectors are read.");
+                    "PS2 Game ID read directly from this ISO after a "
+                    "small ISO9660 sanity check. Only small sectors are read.");
+        }
 
         if (role != Qt::DisplayRole)
             return QVariant();
@@ -425,7 +580,7 @@ private:
         QThreadPool::globalInstance()->start(
                 [self, path]() {
             const QString id =
-                    identifyIsoGameIdFast(path);
+                    identifyPathGameIdFast(path);
 
             if (!self)
                 return;
@@ -2060,6 +2215,132 @@ bool MainWindow::renameInstalledGameOnHdd(
 #endif
 }
 
+bool MainWindow::invalidateOplHddGameListCache(QString *error)
+{
+#ifdef __linux__
+    // PS2_HDD_OPL_GAMELIST_CACHE_INVALIDATE_V1
+    //
+    // OPL caches hdl_game_info_t records in games.bin and may use that cache
+    // on initial HDD-mode entry without rereading externally modified HDL
+    // headers. Truncate games.bin after a PC-side title rename so OPL is
+    // forced to rebuild the list from the real HDL metadata next time.
+    const int diskIndex =
+            diskCombo ? diskCombo->currentIndex() : -1;
+
+    if (diskIndex < 0 ||
+            static_cast<std::size_t>(diskIndex) >=
+                disks.size()) {
+        if (error)
+            *error =
+                    "The selected PS2 HDD disappeared before the OPL "
+                    "game-list cache could be invalidated.";
+        return false;
+    }
+
+    if (pfsshellPath.isEmpty() ||
+            !QFileInfo::exists(pfsshellPath)) {
+        if (error)
+            *error =
+                    "pfsshell is unavailable, so OPL games.bin could not "
+                    "be invalidated.";
+        return false;
+    }
+
+    if (currentOplPartition.isEmpty() ||
+            currentOplBase.isEmpty()) {
+        if (error)
+            *error =
+                    "The OPL PFS storage location is not currently known. "
+                    "Use Refresh HDD, then retry Fix Installed Titles.";
+        return false;
+    }
+
+    QTemporaryFile emptyCache(
+            QDir::tempPath() +
+            "/ps2-hdd-empty-games-XXXXXX.bin");
+    emptyCache.setAutoRemove(true);
+
+    if (!emptyCache.open() ||
+            !emptyCache.resize(0) ||
+            !emptyCache.flush()) {
+        if (error)
+            *error =
+                    "Could not create the temporary empty OPL games.bin.";
+        return false;
+    }
+
+    const QString remotePath =
+            joinPfsPath(
+                currentOplBase,
+                "games.bin");
+
+    QTemporaryFile manifest(
+            QDir::tempPath() +
+            "/ps2-hdd-opl-cache-XXXXXX.tsv");
+    manifest.setAutoRemove(true);
+
+    if (!manifest.open()) {
+        if (error)
+            *error =
+                    "Could not create the OPL cache invalidation manifest.";
+        return false;
+    }
+
+    const QByteArray row =
+            ("F\t" +
+             emptyCache.fileName() +
+             "\t" +
+             remotePath +
+             "\n").toUtf8();
+
+    if (manifest.write(row) != row.size() ||
+            !manifest.flush()) {
+        if (error)
+            *error =
+                    "Could not write the OPL cache invalidation manifest.";
+        return false;
+    }
+
+    const auto &disk =
+            disks[static_cast<std::size_t>(diskIndex)];
+
+    QString output;
+    const bool ok =
+            runPrivilegedWriter(
+                disk,
+                {
+                    "--pfsshell",
+                        pfsshellPath,
+                    "--copy-manifest",
+                        manifest.fileName(),
+                    "--partition",
+                        currentOplPartition
+                },
+                &output);
+
+    if (!ok) {
+        if (error)
+            *error =
+                    "The HDL title change succeeded, but OPL games.bin "
+                    "could not be invalidated.\n\n"
+                    "Use Refresh in OPL before trusting displayed titles.\n\n" +
+                    output.right(4000).trimmed();
+        return false;
+    }
+
+    if (error)
+        error->clear();
+
+    return true;
+#else
+    if (error)
+        *error =
+                "OPL HDD game-list cache invalidation is currently "
+                "Linux/Fedora only.";
+    return false;
+#endif
+}
+
 void MainWindow::renameSelectedInstalledGame()
 {
 #ifdef __linux__
@@ -2159,10 +2440,22 @@ void MainWindow::renameSelectedInstalledGame()
         return;
     }
 
+    QString oplCacheError;
+    const bool oplCacheInvalidated =
+            invalidateOplHddGameListCache(
+                &oplCacheError);
+
     statusLabel->setText(
             QString("Renamed %1 → %2. Refreshing HDD game table...")
                     .arg(game.name, title));
     refreshCurrentPs2Tree();
+
+    if (!oplCacheInvalidated) {
+        QMessageBox::warning(
+                this,
+                "Title renamed - OPL cache warning",
+                oplCacheError);
+    }
 #else
     QMessageBox::information(
             this,
@@ -2263,16 +2556,34 @@ void MainWindow::renameInstalledGamesFromLatestDatabase(
     }
 
     if (plan.empty()) {
-        QMessageBox::information(
-                this,
-                "Installed titles already current",
+        QString oplCacheError;
+        const bool oplCacheInvalidated =
+                invalidateOplHddGameListCache(
+                    &oplCacheError);
+
+        QString message =
                 QString("No installed title needs changing.\n\n"
                         "Already correct: %1\n"
                         "Game IDs absent from current database: %2\n"
                         "Titles over HDL limit: %3")
                         .arg(alreadyCorrect)
                         .arg(missing)
-                        .arg(tooLong));
+                        .arg(tooLong);
+
+        if (oplCacheInvalidated)
+            message +=
+                    "\n\nOPL games.bin was invalidated. "
+                    "The next OPL HDD load will rebuild titles from "
+                    "the real HDL headers.";
+        else
+            message +=
+                    "\n\nOPL cache warning:\n" +
+                    oplCacheError;
+
+        QMessageBox::information(
+                this,
+                "Installed titles already current",
+                message);
         return;
     }
 
@@ -2341,6 +2652,7 @@ void MainWindow::renameInstalledGamesFromLatestDatabase(
     progress.setMinimumWidth(760);
 
     QStringList renamed;
+    QStringList rawAlreadyCorrect;
     QStringList failures;
     int processedBanks = 0;
 
@@ -2440,10 +2752,22 @@ void MainWindow::renameInstalledGamesFromLatestDatabase(
 
         for (const QString &line :
                 output.split('\n', Qt::SkipEmptyParts)) {
+            const QStringList fields = line.split('\t');
+
+            if (line.startsWith("GAME_ALREADY_CORRECT\t")) {
+                if (fields.size() >= 4)
+                    rawAlreadyCorrect <<
+                            QString("%1 [%2 / Bank %3]")
+                                .arg(
+                                    cleanMachineField(fields[3]),
+                                    cleanMachineField(fields[2]),
+                                    cleanMachineField(fields[1]));
+                continue;
+            }
+
             if (!line.startsWith("GAME_RENAMED\t"))
                 continue;
 
-            const QStringList fields = line.split('\t');
             if (fields.size() < 5)
                 continue;
 
@@ -2473,27 +2797,45 @@ void MainWindow::renameInstalledGamesFromLatestDatabase(
             progress.wasCanceled();
     progress.close();
 
+    QString oplCacheError;
+    const bool oplCacheInvalidated =
+            invalidateOplHddGameListCache(
+                &oplCacheError);
+
     statusLabel->setText(
             "Installed-title pass finished. Refreshing HDD game table...");
     refreshCurrentPs2Tree();
 
     QString summary =
-            QString("Renamed successfully: %1 / %2\n"
-                    "Already correct: %3\n"
+            QString("Renamed successfully: %1\n"
+                    "Re-verified already correct from raw HDL header: %2\n"
+                    "Already correct from initial table: %3\n"
                     "Missing from latest gameid.txt: %4\n"
                     "Over HDL title limit: %5")
                     .arg(renamed.size())
-                    .arg(
-                        static_cast<qulonglong>(
-                            plan.size()))
+                    .arg(rawAlreadyCorrect.size())
                     .arg(alreadyCorrect)
                     .arg(missing)
                     .arg(tooLong);
+
+    if (oplCacheInvalidated)
+        summary +=
+                "\nOPL game-list cache: invalidated "
+                "(games.bin will rebuild from HDL headers)";
+    else
+        summary +=
+                "\nOPL game-list cache: WARNING - " +
+                oplCacheError;
 
     if (!renamed.isEmpty())
         summary +=
                 "\n\nRenamed:\n  " +
                 renamed.join("\n  ");
+
+    if (!rawAlreadyCorrect.isEmpty())
+        summary +=
+                "\n\nRaw HDL header was already correct:\n  " +
+                rawAlreadyCorrect.join("\n  ");
 
     if (!failures.isEmpty())
         summary +=

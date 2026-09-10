@@ -1587,7 +1587,7 @@ void runHdlDumpRenameInstalled(
             << "PS2 HDD Writer: INSTALLED GAME RENAME SUCCESS\n";
 }
 
-// PS2_HDD_FAST_BATCH_RENAME_V1
+// PS2_HDD_FAST_BATCH_RENAME_V3
 struct FastRenameRequest
 {
     std::string startup;
@@ -1633,6 +1633,19 @@ std::string fastUpperAscii(std::string value)
         if (ch >= 'a' && ch <= 'z')
             ch = static_cast<char>(ch - 'a' + 'A');
     return value;
+}
+
+// PS2_HDD_FAST_BATCH_RENAME_TITLE_NORMALIZE_V2
+// hdl_toc -> GUI -> manifest already normalizes surrounding whitespace and
+// machine-control whitespace.  The direct HDL-header reader must compare the
+// same logical title rather than requiring byte-for-byte equality with padding
+// that hdl_toc does not expose.
+std::string fastComparableHdlTitle(std::string value)
+{
+    for (char &ch : value)
+        if (ch == '\t' || ch == '\r' || ch == '\n')
+            ch = ' ';
+    return trim(std::move(value));
 }
 
 void fastReadExactAt(int fd, std::uint64_t byteOffset,
@@ -1935,10 +1948,43 @@ void runFastRenameBatch(
                     "Fast rename requires exactly one installed record for Game ID " +
                     request.startup + ".");
 
-            if (record->title != request.oldName)
-                throw std::runtime_error(
-                    "Cached title changed before write for " +
-                    request.startup + ".");
+            // PS2_HDD_RAW_HDL_TITLE_AUTHORITATIVE_V3
+            // hdl_toc uses hdl_dump's legacy fixed-size game-name structure.
+            // Long HDL titles can therefore be misreported by that path.
+            // The direct 0x101000 HDL header is authoritative here.
+            const std::string cachedComparableTitle =
+                    fastComparableHdlTitle(record->title);
+            const std::string desiredComparableTitle =
+                    fastComparableHdlTitle(request.newName);
+            const std::string guiComparableTitle =
+                    fastComparableHdlTitle(request.oldName);
+
+            // A stale/corrupted hdl_toc title must never make us rewrite a
+            // title that is already correct on the disk.
+            if (cachedComparableTitle == desiredComparableTitle)
+            {
+                std::cout
+                        << "GAME_ALREADY_CORRECT\t"
+                        << bank << "\t"
+                        << cleanField(request.startup) << "\t"
+                        << cleanField(record->title) << "\n"
+                        << std::flush;
+                continue;
+            }
+
+            if (cachedComparableTitle != guiComparableTitle)
+                std::cout
+                        << "FAST_RENAME_GUI_TITLE_STALE\t"
+                        << bank << "\t"
+                        << cleanField(request.startup) << "\t"
+                        << record->title.size() << "\t"
+                        << request.oldName.size() << "\t"
+                        << cleanField(record->title) << "\t"
+                        << cleanField(request.oldName) << "\n"
+                        << std::flush;
+
+            const std::string actualOldTitle =
+                    record->title;
 
             auto &partition =
                     partitions[record->partitionIndex];
@@ -1990,11 +2036,14 @@ void runFastRenameBatch(
                     fastBoundedString(
                         hdlBefore.data() + 0x08, 0xa0);
 
+            // Re-read immediately before the write. We verify against
+            // the direct raw-header value cached above, not hdl_toc text.
             if (diskStartup != wantedId ||
-                    diskTitle != request.oldName)
+                    fastComparableHdlTitle(diskTitle) !=
+                        cachedComparableTitle)
                 throw std::runtime_error(
-                    "On-disk HDL metadata no longer matches cached plan for " +
-                    request.startup + ".");
+                    "On-disk HDL metadata changed after the raw-header cache "
+                    "was built for " + request.startup + ".");
 
             std::array<unsigned char, 1024> apaBefore{};
             fastReadExactAt(
@@ -2096,7 +2145,7 @@ void runFastRenameBatch(
                     << "GAME_RENAMED\t"
                     << bank << "\t"
                     << cleanField(request.startup) << "\t"
-                    << cleanField(request.oldName) << "\t"
+                    << cleanField(actualOldTitle) << "\t"
                     << cleanField(request.newName) << "\n"
                     << "FAST_RENAME_PROGRESS\t"
                     << (requestIndex + 1) << "\t"
@@ -2116,6 +2165,140 @@ void runFastRenameBatch(
 
     std::cout
             << "PS2 HDD Writer: FAST INSTALLED GAME RENAME SUCCESS\n";
+}
+
+// PS2_HDD_RAW_HDL_GAME_LIST_V3
+void emitRawHdlGameRecords(
+        const Options &options,
+        int bank)
+{
+    constexpr std::uint64_t SectorBytes = 512;
+    constexpr std::uint64_t BankSectors =
+            (std::uint64_t{1} << 32);
+    constexpr std::uint64_t MaximumVirtualBankSectors =
+            0xfffffffeULL;
+    constexpr std::uint64_t HdlHeaderOffsetSectors =
+            0x00101000ULL / SectorBytes;
+
+    const std::uint64_t totalSectors =
+            options.expectedSize / SectorBytes;
+    const std::uint64_t bankBase =
+            static_cast<std::uint64_t>(bank) *
+            BankSectors;
+
+    if (bankBase >= totalSectors)
+        throw std::runtime_error(
+                "Requested game-list bank lies beyond the selected disk.");
+
+    const std::uint64_t bankSectors =
+            std::min<std::uint64_t>(
+                totalSectors - bankBase,
+                MaximumVirtualBankSectors);
+
+    const auto partitions =
+            Ps2::Apa::ReadPartitionChain(
+                options.device,
+                bankBase,
+                bankSectors);
+
+    const int fd = open(
+            options.device.c_str(),
+            O_RDONLY | O_CLOEXEC);
+
+    if (fd < 0)
+        throw std::runtime_error(
+                "Could not open selected HDD for raw HDL game list: " +
+                std::string(std::strerror(errno)));
+
+    try
+    {
+        for (const auto &partition : partitions)
+        {
+            if (partition.header.type != 0x1337 ||
+                    (partition.header.flags & 0x0001) != 0)
+                continue;
+
+            const std::uint64_t hdlSector =
+                    partition.physicalSector +
+                    HdlHeaderOffsetSectors;
+
+            std::array<unsigned char, 1024> header{};
+            fastReadExactAt(
+                fd,
+                hdlSector * SectorBytes,
+                header.data(),
+                header.size());
+
+            if (fastReadLe32(header.data()) != 0xdeadfeedU)
+                continue;
+
+            const std::string title =
+                    fastBoundedString(
+                        header.data() + 0x08,
+                        0xa0);
+
+            const std::string startup =
+                    fastUpperAscii(
+                        fastBoundedString(
+                            header.data() + 0xac,
+                            12));
+
+            if (startup.empty())
+                continue;
+
+            const char *media =
+                    header[0x00ec] == 0x14
+                        ? "DVD"
+                        : "CD";
+
+            const std::size_t numParts =
+                    static_cast<std::size_t>(
+                        header[0x00f0]);
+
+            std::uint64_t rawSizeUnits = 0;
+
+            for (std::size_t i = 0;
+                    i < numParts;
+                    ++i)
+            {
+                const std::size_t lengthOffset =
+                        0x00f5 +
+                        i * 12 +
+                        8;
+
+                if (lengthOffset + 4 >
+                        header.size())
+                    throw std::runtime_error(
+                        "Invalid HDL allocation table while listing " +
+                        startup + ".");
+
+                rawSizeUnits +=
+                        fastReadLe32(
+                            header.data() +
+                            lengthOffset);
+            }
+
+            const std::uint64_t sizeKb =
+                    rawSizeUnits / 4ULL;
+
+            std::cout
+                    << "GAME\t"
+                    << bank << "\t"
+                    << media << "\t"
+                    << sizeKb << "\t"
+                    << cleanField(startup) << "\t"
+                    << cleanField(title) << "\n";
+        }
+
+        if (close(fd) != 0)
+            throw std::runtime_error(
+                    "Could not close selected HDD after raw HDL game list.");
+    }
+    catch (...)
+    {
+        close(fd);
+        throw;
+    }
 }
 
 void emitGameRecords(const std::string &toc, int bank)
@@ -2969,7 +3152,7 @@ int main(int argc, char **argv)
             for (int bank = first; bank < last; ++bank)
             {
                 if (!bankHasValidMbr(options, static_cast<std::uint32_t>(bank))) continue;
-                emitGameRecords(runHdlDumpToc(options, bank), bank);
+                emitRawHdlGameRecords(options, bank);
             }
             std::cout << "PS2 HDD Writer: GAME LIST SUCCESS\n";
             return 0;
