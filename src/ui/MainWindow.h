@@ -11,6 +11,7 @@
 #include "core/PhysicalDisk.h"
 
 class QComboBox;
+class QCheckBox;
 class QModelIndex;
 class QEvent;
 class QFileSystemModel;
@@ -61,6 +62,13 @@ private:
 
     void installSelectedPcGames();
     void installGameFiles(const QStringList &paths);
+    struct InstalledGameRef;
+    void renameSelectedInstalledGame();
+    void renameInstalledGamesFromLatestDatabase(bool allInstalled);
+    bool renameInstalledGameOnHdd(const InstalledGameRef &game,
+            const QString &newName, QString *error);
+    bool fetchLatestGameTitleDatabase(QHash<QString, QString> *titles,
+            QString *error);
     void toggleMarkedPcPath(const QModelIndex &index);
     QStringList markedOrSelectedPcPaths() const;
     void updateMarkedStatus();
@@ -71,6 +79,7 @@ private:
     struct InstalledGameRef {
         QString name;
         QString gameId;
+        int bank = 0;
     };
     std::vector<InstalledGameRef> installedGames(bool selectedOnly = false) const;
     void addArtwork();
@@ -100,6 +109,7 @@ private:
     QLineEdit *pcPath = nullptr;
     QComboBox *diskCombo = nullptr;
     QComboBox *gameBankCombo = nullptr;
+    QCheckBox *renameOnTransferCheck = nullptr;
     QTreeWidget *ps2View = nullptr;
     QLabel *statusLabel = nullptr;
     QLabel *overallProgressDetail = nullptr;
