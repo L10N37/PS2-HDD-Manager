@@ -178,7 +178,7 @@ printf '%s\n' "ps2homebrew/pfsshell @ $pfsshell_commit" "patch=$pfsshell_patch_r
 
 # ----- hdl-dump ---------------------------------------------------------------
 hdl_commit="32c296c69cf9c263fcbe035004aa28c345b3b279"
-hdl_patch_rev="banked-hio-v1+scan-progress-v2"
+hdl_patch_rev="banked-hio-v1+scan-progress-v2+rename-self-collision-v1"
 hdl_key="${hdl_commit}-${hdl_patch_rev}"
 hdl_cache="$backend_cache/hdl-dump/$hdl_key"
 hdl_cached_bin="$hdl_cache/bin/hdl_dump"
@@ -359,6 +359,77 @@ for marker in ('HDL_SCAN_TOTAL', 'HDL_SCAN_PROGRESS', 'progress_total'):
 
 p.write_text(s)
 PYHDLSCANV14B
+
+    # PS2_HDD_MANAGER_RENAME_SELF_COLLISION_V1
+    # Upstream hdl-dump treats the current APA partition as a duplicate when a
+    # rename changes only title characters beyond the 16-character APA-ID
+    # title prefix. Permit that exact same-partition match while retaining the
+    # collision refusal for every other partition.
+    python3 - "$hdl_cache/source/hdl.c" <<'PYHDLRENAMESELF'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text(encoding="utf-8")
+
+old = """            result = apa_find_partition(toc, part_id, &tmp_slice_index,
+                                        &tmp_partition_index);
+            if (result == RET_NOT_FOUND) {
+                strcpy(part->header.id, part_id);
+                set_u32(&part->header.checksum,
+                        apa_partition_checksum(&part->header));
+                part->modified = 1;
+                result = RET_OK;
+            } else if (result == RET_OK)
+                /* partition with such name already exists */
+                result = RET_PART_EXISTS;
+"""
+
+new = """            result = apa_find_partition(toc, part_id, &tmp_slice_index,
+                                        &tmp_partition_index);
+            if (result == RET_NOT_FOUND) {
+                strcpy(part->header.id, part_id);
+                set_u32(&part->header.checksum,
+                        apa_partition_checksum(&part->header));
+                part->modified = 1;
+                result = RET_OK;
+            } else if (result == RET_OK) {
+                /*
+                 * PS2_HDD_MANAGER_RENAME_SELF_COLLISION_V1
+                 *
+                 * hdl_pname() stores only the first 16 normalized title
+                 * characters in the 32-byte APA ID. If a rename changes only
+                 * later characters, apa_find_partition() finds this very same
+                 * partition and upstream incorrectly reports RET_PART_EXISTS.
+                 *
+                 * Accept only an exact self-match. A match to any other APA
+                 * partition remains a real collision and is still refused.
+                 */
+                const apa_partition_t *matched =
+                        toc->slice[tmp_slice_index].parts +
+                        tmp_partition_index;
+                if (tmp_slice_index == slice_index && matched == part)
+                    result = RET_OK;
+                else
+                    result = RET_PART_EXISTS;
+            }
+"""
+
+if new in s:
+    pass
+elif old in s:
+    s = s.replace(old, new, 1)
+else:
+    raise SystemExit(
+        "Pinned hdl-dump rename block did not match the expected source. "
+        "No backend was built."
+    )
+
+if "PS2_HDD_MANAGER_RENAME_SELF_COLLISION_V1" not in s:
+    raise SystemExit("Rename self-collision patch verification failed.")
+
+p.write_text(s, encoding="utf-8")
+PYHDLRENAMESELF
 
     python3 - "$hdl_cache/source/apa.c" <<'PYAPASCANV14B'
 from pathlib import Path

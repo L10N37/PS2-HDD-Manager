@@ -47,6 +47,10 @@ struct Options
     std::string hdlDump;
     std::string installGame;
     std::string gameName;
+    std::string renameInstalledGame;
+    std::string newGameName;
+    std::string startupId;
+    std::string renameBatchManifest;
     std::string media;
     int bank = -1;
     bool extendedBanks = false;
@@ -75,6 +79,8 @@ struct Options
         << "  " << program << " --device /dev/sdX --expected-size BYTES --hdl-dump PATH "
            "--install-game IMAGE --game-name NAME --media cd|dvd\n"
         << "  " << program << " --device /dev/sdX --expected-size BYTES --hdl-dump PATH --list-games\n"
+        << "  " << program << " --device /dev/sdX --expected-size BYTES --hdl-dump PATH "
+           "--rename-installed OLD --new-game-name NEW --startup-id ID --bank N\n"
         << "  " << program << " --device /dev/sdX --expected-size BYTES --pfsshell PATH "
            "--list-pfs [--partition auto|NAME] [--pfs-path /PATH]\n"
         << "  " << program << " --device /dev/sdX --expected-size BYTES --pfsshell PATH "
@@ -126,6 +132,10 @@ Options parseOptions(int argc, char **argv)
         else if (argument == "--hdl-dump") options.hdlDump = value;
         else if (argument == "--install-game") options.installGame = value;
         else if (argument == "--game-name") options.gameName = value;
+        else if (argument == "--rename-installed") options.renameInstalledGame = value;
+        else if (argument == "--new-game-name") options.newGameName = value;
+        else if (argument == "--startup-id") options.startupId = value;
+        else if (argument == "--rename-batch-manifest") options.renameBatchManifest = value;
         else if (argument == "--media") options.media = value;
         else if (argument == "--bank") options.bank = std::stoi(value);
         else if (argument == "--partition") options.pfsPartition = value;
@@ -138,6 +148,53 @@ Options parseOptions(int argc, char **argv)
     }
 
     const bool commonPhysical = !options.device.empty() && options.smokeImage.empty() && options.expectedSize != 0;
+
+    const bool anyRenameArgument =
+            !options.renameInstalledGame.empty() ||
+            !options.newGameName.empty() ||
+            !options.startupId.empty();
+
+    const bool renameInstalledMode =
+            commonPhysical &&
+            !options.hdlDump.empty() &&
+            !options.renameInstalledGame.empty() &&
+            !options.newGameName.empty() &&
+            !options.startupId.empty() &&
+            options.installGame.empty() &&
+            options.pfsshell.empty() &&
+            !options.provision.any() &&
+            !options.listGames &&
+            !options.listPfs &&
+            !options.ensureCoverArt &&
+            !options.bankSpace &&
+            !options.checkExistingGame &&
+            options.copyManifest.empty() &&
+            options.bank >= 0;
+
+    if (anyRenameArgument && !renameInstalledMode)
+        usage(argv[0]);
+
+    const bool renameBatchMode =
+            commonPhysical &&
+            !options.hdlDump.empty() &&
+            !options.renameBatchManifest.empty() &&
+            options.renameInstalledGame.empty() &&
+            options.newGameName.empty() &&
+            options.startupId.empty() &&
+            options.installGame.empty() &&
+            options.pfsshell.empty() &&
+            !options.provision.any() &&
+            !options.listGames &&
+            !options.listPfs &&
+            !options.ensureCoverArt &&
+            !options.bankSpace &&
+            !options.checkExistingGame &&
+            options.copyManifest.empty() &&
+            options.bank >= 0;
+
+    if (!options.renameBatchManifest.empty() && !renameBatchMode)
+        usage(argv[0]);
+
     const bool gameMode = commonPhysical && !options.hdlDump.empty() && !options.installGame.empty() &&
             !options.gameName.empty() && (options.media == "cd" || options.media == "dvd") &&
             options.pfsshell.empty() && !options.provision.any() && !options.listGames && !options.listPfs &&
@@ -196,7 +253,8 @@ Options parseOptions(int argc, char **argv)
             options.installGame.empty() && !options.listGames && !options.listPfs && !options.ensureCoverArt && options.copyManifest.empty();
     if (!physicalMode && !smokeMode && !gameMode && !listGamesMode &&
             !listPfsMode && !copyPfsMode && !coverArtMode &&
-            !bankSpaceMode && !checkExistingMode)
+            !bankSpaceMode && !checkExistingMode &&
+            !renameInstalledMode && !renameBatchMode)
         usage(argv[0]);
     if (physicalMode && options.provision.any() && options.payloadDirectory.empty())
         usage(argv[0]);
@@ -1399,6 +1457,667 @@ bool exactDiscMatch(
             installed.sizeKb == source.sizeKb;
 }
 
+// PS2_HDD_RENAME_INSTALLED_V3
+const HdlInstalledRecord *findInstalledByStartup(
+        const std::vector<HdlInstalledRecord> &records,
+        const std::string &startup)
+{
+    for (const auto &record : records)
+        if (record.startup == startup)
+            return &record;
+    return nullptr;
+}
+
+void requireSafeHdlTitle(const std::string &title)
+{
+    if (title.empty() || title.size() > 159)
+        throw std::runtime_error(
+                "HDL title must contain 1-159 bytes.");
+
+    if (title[0] == '+' ||
+            title[0] == '*' ||
+            title[0] == '-' ||
+            (title.size() >= 2 &&
+             title[0] == '0' &&
+             (title[1] == 'x' || title[1] == 'X')))
+        throw std::runtime_error(
+                "HDL title begins with a token reserved by hdl_dump modify.");
+
+    for (const unsigned char ch : title)
+        if (ch < 0x20 || ch == 0x7f)
+            throw std::runtime_error(
+                    "HDL title contains a control character.");
+}
+
+void runHdlDumpRenameInstalled(
+        const Options &options,
+        int bank)
+{
+    requireSafeHdlTitle(options.newGameName);
+
+    const std::string target =
+            bankedDevicePath(options, bank);
+
+    const auto beforeRecords =
+            parseInstalledRecords(
+                runHdlDumpToc(options, bank));
+
+    const HdlInstalledRecord *before =
+            findInstalledByStartup(
+                beforeRecords,
+                options.startupId);
+
+    if (!before)
+        throw std::runtime_error(
+                "Installed Game ID disappeared before rename.");
+
+    if (before->name != options.renameInstalledGame)
+        throw std::runtime_error(
+                "Installed title changed since the GUI scan; refresh before renaming.");
+
+    int sameNameCount = 0;
+    for (const auto &record : beforeRecords)
+        if (record.name == options.renameInstalledGame)
+            ++sameNameCount;
+
+    if (sameNameCount != 1)
+        throw std::runtime_error(
+                "Multiple installed games share the same current title. "
+                "The manager refuses an ambiguous hdl_dump modify.");
+
+    std::cout
+            << "STAGE: Renaming installed HDL metadata in place on Bank "
+            << bank << "...\n"
+            << std::flush;
+
+    const pid_t child = fork();
+    if (child < 0)
+        throw std::runtime_error(
+                "Unable to start hdl_dump modify.");
+
+    if (child == 0)
+    {
+        execl(
+                options.hdlDump.c_str(),
+                options.hdlDump.c_str(),
+                "modify",
+                target.c_str(),
+                options.renameInstalledGame.c_str(),
+                options.newGameName.c_str(),
+                static_cast<char *>(nullptr));
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(child, &status, 0) < 0 ||
+            !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 0)
+        throw std::runtime_error(
+                "hdl_dump modify failed; no later installed-title writes were attempted.");
+
+    std::cout
+            << "STAGE: Verifying renamed HDL header against Game ID "
+            << cleanField(options.startupId)
+            << "...\n"
+            << std::flush;
+
+    const auto afterRecords =
+            parseInstalledRecords(
+                runHdlDumpToc(options, bank));
+
+    const HdlInstalledRecord *after =
+            findInstalledByStartup(
+                afterRecords,
+                options.startupId);
+
+    if (!after)
+        throw std::runtime_error(
+                "Post-rename verification could not find the installed Game ID.");
+
+    if (after->name != options.newGameName)
+        throw std::runtime_error(
+                "Post-rename verification found the Game ID but the title does not match.");
+
+    std::cout
+            << "GAME_RENAMED\t"
+            << bank << "\t"
+            << cleanField(options.startupId) << "\t"
+            << cleanField(options.renameInstalledGame) << "\t"
+            << cleanField(options.newGameName) << "\n"
+            << "PS2 HDD Writer: INSTALLED GAME RENAME SUCCESS\n";
+}
+
+// PS2_HDD_FAST_BATCH_RENAME_V1
+struct FastRenameRequest
+{
+    std::string startup;
+    std::string oldName;
+    std::string newName;
+};
+
+struct FastInstalledRecord
+{
+    std::size_t partitionIndex = 0;
+    std::uint64_t hdlHeaderSector = 0;
+    std::string startup;
+    std::string title;
+};
+
+std::uint32_t fastReadLe32(const unsigned char *p)
+{
+    return static_cast<std::uint32_t>(p[0]) |
+            (static_cast<std::uint32_t>(p[1]) << 8) |
+            (static_cast<std::uint32_t>(p[2]) << 16) |
+            (static_cast<std::uint32_t>(p[3]) << 24);
+}
+
+void fastWriteLe32(unsigned char *p, std::uint32_t value)
+{
+    p[0] = static_cast<unsigned char>(value & 0xff);
+    p[1] = static_cast<unsigned char>((value >> 8) & 0xff);
+    p[2] = static_cast<unsigned char>((value >> 16) & 0xff);
+    p[3] = static_cast<unsigned char>((value >> 24) & 0xff);
+}
+
+std::string fastBoundedString(const unsigned char *p, std::size_t maximum)
+{
+    std::size_t length = 0;
+    while (length < maximum && p[length] != 0)
+        ++length;
+    return std::string(reinterpret_cast<const char *>(p), length);
+}
+
+std::string fastUpperAscii(std::string value)
+{
+    for (char &ch : value)
+        if (ch >= 'a' && ch <= 'z')
+            ch = static_cast<char>(ch - 'a' + 'A');
+    return value;
+}
+
+void fastReadExactAt(int fd, std::uint64_t byteOffset,
+        unsigned char *buffer, std::size_t bytes)
+{
+    std::size_t done = 0;
+    while (done < bytes)
+    {
+        const ssize_t amount = pread(
+                fd, buffer + done, bytes - done,
+                static_cast<off_t>(byteOffset + done));
+        if (amount < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            throw std::runtime_error(
+                    "Fast HDL metadata read failed: " +
+                    std::string(std::strerror(errno)));
+        }
+        if (amount == 0)
+            throw std::runtime_error(
+                    "Unexpected end of disk while reading HDL metadata.");
+        done += static_cast<std::size_t>(amount);
+    }
+}
+
+void fastWriteExactAt(int fd, std::uint64_t byteOffset,
+        const unsigned char *buffer, std::size_t bytes)
+{
+    std::size_t done = 0;
+    while (done < bytes)
+    {
+        const ssize_t amount = pwrite(
+                fd, buffer + done, bytes - done,
+                static_cast<off_t>(byteOffset + done));
+        if (amount < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            throw std::runtime_error(
+                    "Fast HDL metadata write failed: " +
+                    std::string(std::strerror(errno)));
+        }
+        if (amount == 0)
+            throw std::runtime_error(
+                    "Short write while updating HDL metadata.");
+        done += static_cast<std::size_t>(amount);
+    }
+}
+
+std::string fastHdlPartitionId(
+        const std::string &startup,
+        const std::string &title,
+        const std::string &prefix)
+{
+    if (title.size() > 9 &&
+            title.compare(0, 9, "__.linux.") == 0)
+        return title.substr(
+                0, std::min<std::size_t>(title.size(), 32));
+
+    if (startup.size() < 11)
+        throw std::runtime_error(
+                "Invalid cached HDL Game ID: " + startup);
+
+    const std::size_t titleLength =
+            std::min<std::size_t>(title.size(), 16);
+
+    std::string id(15 + titleLength, '\0');
+    id[0] = prefix.size() > 0 ? prefix[0] : 'P';
+    id[1] = prefix.size() > 1 ? prefix[1] : 'P';
+    id[2] = '.';
+
+    const char fallback[] = "SLUS-00000";
+    std::memcpy(&id[3], fallback, 10);
+    std::memcpy(&id[3], startup.data(), 8);
+    id[11] = startup[9];
+    id[12] = startup[10];
+    id[7] = '-';
+    id[13] = '.';
+    id[14] = '.';
+    if (titleLength != 0)
+        std::memcpy(&id[15], title.data(), titleLength);
+
+    for (std::size_t i = 3; i < id.size(); ++i)
+    {
+        const unsigned char ch =
+                static_cast<unsigned char>(id[i]);
+
+        if (i < 7)
+        {
+            if (std::islower(ch))
+                id[i] = static_cast<char>(std::toupper(ch));
+            else if (!std::isalpha(ch))
+                id[i] = 'X';
+        }
+        else if (i > 7 && i < 13)
+        {
+            if (!std::isdigit(ch))
+                id[i] = '0';
+        }
+        else if (i > 14)
+        {
+            if (std::islower(ch))
+                id[i] = static_cast<char>(std::toupper(ch));
+            else if (!std::isalnum(ch))
+                id[i] = '_';
+        }
+    }
+
+    return id;
+}
+
+std::uint32_t fastApaChecksum(
+        const std::array<unsigned char, 1024> &header)
+{
+    std::uint32_t sum = 0;
+    for (std::size_t offset = 4;
+            offset < header.size();
+            offset += 4)
+        sum += fastReadLe32(header.data() + offset);
+    return sum;
+}
+
+std::vector<FastRenameRequest>
+readFastRenameManifest(const std::string &path)
+{
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+        throw std::runtime_error(
+                "Could not open fast rename manifest.");
+
+    std::vector<FastRenameRequest> result;
+    std::string line;
+
+    while (std::getline(input, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty())
+            continue;
+
+        const std::size_t first = line.find('\t');
+        const std::size_t second =
+                first == std::string::npos
+                    ? std::string::npos
+                    : line.find('\t', first + 1);
+
+        if (first == std::string::npos ||
+                second == std::string::npos ||
+                line.find('\t', second + 1) != std::string::npos)
+            throw std::runtime_error(
+                    "Malformed fast rename manifest.");
+
+        FastRenameRequest row;
+        row.startup = line.substr(0, first);
+        row.oldName = line.substr(
+                first + 1, second - first - 1);
+        row.newName = line.substr(second + 1);
+
+        requireSafeHdlTitle(row.newName);
+
+        if (row.startup.empty() || row.oldName.empty())
+            throw std::runtime_error(
+                    "Fast rename manifest contains an empty Game ID/title.");
+
+        result.push_back(std::move(row));
+
+        if (result.size() > 4096)
+            throw std::runtime_error(
+                    "Fast rename manifest is unexpectedly large.");
+    }
+
+    if (result.empty())
+        throw std::runtime_error(
+                "Fast rename manifest contained no titles.");
+
+    return result;
+}
+
+void runFastRenameBatch(
+        const Options &options,
+        int bank)
+{
+    const auto requests =
+            readFastRenameManifest(options.renameBatchManifest);
+
+    constexpr std::uint64_t SectorBytes = 512;
+    constexpr std::uint64_t BankSectors =
+            (std::uint64_t{1} << 32);
+    constexpr std::uint64_t MaximumVirtualBankSectors =
+            0xfffffffeULL;
+    constexpr std::uint64_t HdlHeaderOffsetSectors =
+            0x00101000ULL / SectorBytes;
+
+    const std::uint64_t totalSectors =
+            options.expectedSize / SectorBytes;
+    const std::uint64_t bankBase =
+            static_cast<std::uint64_t>(bank) *
+            BankSectors;
+
+    if (bankBase >= totalSectors)
+        throw std::runtime_error(
+                "Requested rename bank lies beyond the selected disk.");
+
+    const std::uint64_t bankSectors =
+            std::min<std::uint64_t>(
+                totalSectors - bankBase,
+                MaximumVirtualBankSectors);
+
+    std::cout
+            << "STAGE: Fast HDL title batch: scanning Bank "
+            << bank
+            << " once and caching Game ID + APA position...\n"
+            << std::flush;
+
+    auto partitions =
+            Ps2::Apa::ReadPartitionChain(
+                options.device,
+                bankBase,
+                bankSectors);
+
+    const int fd = open(
+            options.device.c_str(),
+            O_RDWR | O_CLOEXEC);
+
+    if (fd < 0)
+        throw std::runtime_error(
+                "Could not open selected HDD for fast metadata rename: " +
+                std::string(std::strerror(errno)));
+
+    try
+    {
+        std::vector<FastInstalledRecord> installed;
+
+        for (std::size_t index = 0;
+                index < partitions.size();
+                ++index)
+        {
+            const auto &partition = partitions[index];
+
+            if (partition.header.type != 0x1337 ||
+                    (partition.header.flags & 0x0001) != 0)
+                continue;
+
+            const std::uint64_t hdlSector =
+                    partition.physicalSector +
+                    HdlHeaderOffsetSectors;
+
+            std::array<unsigned char, 1024> header{};
+            fastReadExactAt(
+                fd,
+                hdlSector * SectorBytes,
+                header.data(),
+                header.size());
+
+            if (fastReadLe32(header.data()) != 0xdeadfeedU)
+                continue;
+
+            FastInstalledRecord record;
+            record.partitionIndex = index;
+            record.hdlHeaderSector = hdlSector;
+            record.title = fastBoundedString(
+                    header.data() + 0x08, 0xa0);
+            record.startup = fastUpperAscii(
+                    fastBoundedString(
+                        header.data() + 0xac, 12));
+
+            if (!record.startup.empty())
+                installed.push_back(std::move(record));
+        }
+
+        std::cout
+                << "FAST_RENAME_CACHE\t"
+                << bank << "\t"
+                << installed.size() << "\n"
+                << std::flush;
+
+        for (std::size_t requestIndex = 0;
+                requestIndex < requests.size();
+                ++requestIndex)
+        {
+            const auto &request = requests[requestIndex];
+            const std::string wantedId =
+                    fastUpperAscii(request.startup);
+
+            FastInstalledRecord *record = nullptr;
+            int matches = 0;
+
+            for (auto &candidate : installed)
+            {
+                if (candidate.startup == wantedId)
+                {
+                    record = &candidate;
+                    ++matches;
+                }
+            }
+
+            if (matches != 1 || record == nullptr)
+                throw std::runtime_error(
+                    "Fast rename requires exactly one installed record for Game ID " +
+                    request.startup + ".");
+
+            if (record->title != request.oldName)
+                throw std::runtime_error(
+                    "Cached title changed before write for " +
+                    request.startup + ".");
+
+            auto &partition =
+                    partitions[record->partitionIndex];
+
+            const std::string currentPartitionId =
+                    partition.header.id;
+
+            if (currentPartitionId.size() < 3)
+                throw std::runtime_error(
+                    "Invalid APA partition ID for " +
+                    request.startup + ".");
+
+            const std::string newPartitionId =
+                    fastHdlPartitionId(
+                        request.startup,
+                        request.newName,
+                        currentPartitionId.substr(0, 3));
+
+            for (std::size_t other = 0;
+                    other < partitions.size();
+                    ++other)
+            {
+                if (other != record->partitionIndex &&
+                        partitions[other].header.id ==
+                            newPartitionId)
+                    throw std::runtime_error(
+                        "APA partition-name collision while renaming " +
+                        request.startup +
+                        "; no write was performed for this title.");
+            }
+
+            std::array<unsigned char, 1024> hdlBefore{};
+            fastReadExactAt(
+                fd,
+                record->hdlHeaderSector * SectorBytes,
+                hdlBefore.data(),
+                hdlBefore.size());
+
+            if (fastReadLe32(hdlBefore.data()) != 0xdeadfeedU)
+                throw std::runtime_error(
+                    "HDL header magic changed before write for " +
+                    request.startup + ".");
+
+            const std::string diskStartup =
+                    fastUpperAscii(
+                        fastBoundedString(
+                            hdlBefore.data() + 0xac, 12));
+            const std::string diskTitle =
+                    fastBoundedString(
+                        hdlBefore.data() + 0x08, 0xa0);
+
+            if (diskStartup != wantedId ||
+                    diskTitle != request.oldName)
+                throw std::runtime_error(
+                    "On-disk HDL metadata no longer matches cached plan for " +
+                    request.startup + ".");
+
+            std::array<unsigned char, 1024> apaBefore{};
+            fastReadExactAt(
+                fd,
+                partition.physicalSector * SectorBytes,
+                apaBefore.data(),
+                apaBefore.size());
+
+            const std::string rawPartitionId =
+                    fastBoundedString(
+                        apaBefore.data() + 0x10, 32);
+
+            if (rawPartitionId != currentPartitionId)
+                throw std::runtime_error(
+                    "APA partition identity changed before write for " +
+                    request.startup + ".");
+
+            std::array<unsigned char, 1024> hdlAfter = hdlBefore;
+            std::memset(hdlAfter.data() + 0x08, 0, 0xa0);
+            std::memcpy(
+                hdlAfter.data() + 0x08,
+                request.newName.data(),
+                request.newName.size());
+
+            std::array<unsigned char, 1024> apaAfter = apaBefore;
+
+            if (newPartitionId != currentPartitionId)
+            {
+                std::memset(apaAfter.data() + 0x10, 0, 32);
+                std::memcpy(
+                    apaAfter.data() + 0x10,
+                    newPartitionId.data(),
+                    newPartitionId.size());
+
+                fastWriteLe32(apaAfter.data(), 0);
+                fastWriteLe32(
+                    apaAfter.data(),
+                    fastApaChecksum(apaAfter));
+            }
+
+            // Same ordering used by hdl-dump: HDL header first,
+            // then APA metadata when the shortened partition ID changes.
+            fastWriteExactAt(
+                fd,
+                record->hdlHeaderSector * SectorBytes,
+                hdlAfter.data(),
+                hdlAfter.size());
+
+            if (newPartitionId != currentPartitionId)
+                fastWriteExactAt(
+                    fd,
+                    partition.physicalSector * SectorBytes,
+                    apaAfter.data(),
+                    apaAfter.size());
+
+            if (fsync(fd) != 0)
+                throw std::runtime_error(
+                    "fsync failed after HDL title metadata write: " +
+                    std::string(std::strerror(errno)));
+
+            std::array<unsigned char, 1024> verifyHdl{};
+            fastReadExactAt(
+                fd,
+                record->hdlHeaderSector * SectorBytes,
+                verifyHdl.data(),
+                verifyHdl.size());
+
+            if (fastUpperAscii(
+                    fastBoundedString(
+                        verifyHdl.data() + 0xac, 12)) != wantedId ||
+                    fastBoundedString(
+                        verifyHdl.data() + 0x08, 0xa0) !=
+                        request.newName)
+                throw std::runtime_error(
+                    "Direct post-write HDL verification failed for " +
+                    request.startup + ".");
+
+            if (newPartitionId != currentPartitionId)
+            {
+                std::array<unsigned char, 1024> verifyApa{};
+                fastReadExactAt(
+                    fd,
+                    partition.physicalSector * SectorBytes,
+                    verifyApa.data(),
+                    verifyApa.size());
+
+                if (fastBoundedString(
+                        verifyApa.data() + 0x10, 32) !=
+                        newPartitionId)
+                    throw std::runtime_error(
+                        "Direct post-write APA verification failed for " +
+                        request.startup + ".");
+            }
+
+            record->title = request.newName;
+            partition.header.id = newPartitionId;
+
+            std::cout
+                    << "GAME_RENAMED\t"
+                    << bank << "\t"
+                    << cleanField(request.startup) << "\t"
+                    << cleanField(request.oldName) << "\t"
+                    << cleanField(request.newName) << "\n"
+                    << "FAST_RENAME_PROGRESS\t"
+                    << (requestIndex + 1) << "\t"
+                    << requests.size() << "\n"
+                    << std::flush;
+        }
+
+        if (close(fd) != 0)
+            throw std::runtime_error(
+                    "Could not close selected HDD after fast rename.");
+    }
+    catch (...)
+    {
+        close(fd);
+        throw;
+    }
+
+    std::cout
+            << "PS2 HDD Writer: FAST INSTALLED GAME RENAME SUCCESS\n";
+}
+
 void emitGameRecords(const std::string &toc, int bank)
 {
     std::istringstream lines(toc);
@@ -1990,6 +2709,8 @@ void preflight(const Options &options)
 
     const bool formatRequest =
             options.installGame.empty() &&
+            options.renameInstalledGame.empty() &&
+            options.renameBatchManifest.empty() &&
             !options.listGames &&
             !options.listPfs &&
             !options.ensureCoverArt &&
@@ -2077,6 +2798,33 @@ int main(int argc, char **argv)
 #endif
         const Options options = parseOptions(argc, argv);
 #ifdef __linux__
+        if (!options.renameBatchManifest.empty())
+        {
+            std::cout
+                    << "STAGE: Re-checking target safety once for fast installed-title batch...\n"
+                    << std::flush;
+
+            preflight(options);
+            const int bank = options.bank;
+            verifyGameBank(options, bank);
+            runFastRenameBatch(options, bank);
+            return 0;
+        }
+
+        if (!options.renameInstalledGame.empty())
+        {
+            std::cout
+                    << "STAGE: Re-checking target safety for installed HDL title rename...\n"
+                    << std::flush;
+
+            preflight(options);
+
+            const int bank = options.bank;
+            verifyGameBank(options, bank);
+            runHdlDumpRenameInstalled(options, bank);
+            return 0;
+        }
+
         if (options.checkExistingGame)
         {
             std::cout

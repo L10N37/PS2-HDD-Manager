@@ -32,15 +32,18 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QKeySequence>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QMimeData>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QProcess>
+#include <QPointer>
 #include <QPainter>
 #include <QProgressBar>
 #include <QProgressDialog>
@@ -59,6 +62,7 @@
 #include <QStyle>
 #include <QPalette>
 #include <QTemporaryFile>
+#include <QThreadPool>
 #include <QTimer>
 #include <QTextStream>
 #include <QTextCursor>
@@ -116,6 +120,103 @@ QString normalizedLocalPath(const QString &path)
     return QDir::cleanPath(info.absoluteFilePath());
 }
 
+// PS2_HDD_LIVE_GAMEID_DATABASE_V2
+bool parseLiveGameIdDatabase(const QByteArray &data,
+        QHash<QString, QString> *titles, QString *error)
+{
+    if (!titles)
+        return false;
+
+    titles->clear();
+    int duplicateCount = 0;
+    int lineNumber = 0;
+
+    QTextStream stream(data);
+    while (!stream.atEnd()) {
+        QString line = stream.readLine();
+        ++lineNumber;
+
+        while (!line.isEmpty() &&
+               (line.endsWith(' ') || line.endsWith('\t') || line.endsWith(QChar('\0'))))
+            line.chop(1);
+
+        if (line.isEmpty())
+            continue;
+
+        if (line.size() < 13 || line.at(11) != QChar(' ')) {
+            if (error)
+                *error = QString("Current gameid.txt is malformed at line %1.")
+                        .arg(lineNumber);
+            titles->clear();
+            return false;
+        }
+
+        const QString id = line.left(11).toUpper();
+        QString title = line.mid(12).trimmed();
+        title.replace("^!", "!");
+
+        if (title.isEmpty()) {
+            if (error)
+                *error = QString("Current gameid.txt has an empty title for %1.")
+                        .arg(id);
+            titles->clear();
+            return false;
+        }
+
+        if (titles->contains(id)) {
+            ++duplicateCount;
+            continue;
+        }
+
+        titles->insert(id, title);
+    }
+
+    if (titles->size() < 13000) {
+        if (error)
+            *error = QString("Current gameid.txt is unexpectedly small (%1 records).")
+                    .arg(titles->size());
+        titles->clear();
+        return false;
+    }
+
+    if (duplicateCount != 0) {
+        if (error)
+            *error = QString("Current gameid.txt contains %1 duplicate Game ID(s).")
+                    .arg(duplicateCount);
+        titles->clear();
+        return false;
+    }
+
+    if (error)
+        error->clear();
+    return true;
+}
+
+QString portableGameFilenameError(const QString &stem)
+{
+    static const QString forbidden = QStringLiteral("<>:\"/\\|?*");
+
+    for (const QChar ch : stem) {
+        if (ch.unicode() < 32 || forbidden.contains(ch))
+            return "database title contains a character forbidden in a portable filename";
+    }
+
+    if (stem.isEmpty() || stem.endsWith(' ') || stem.endsWith('.'))
+        return "database title ends with a character forbidden in a portable filename";
+
+    const QString lower = stem.toLower();
+    if (lower == "con" || lower == "prn" || lower == "aux" || lower == "nul")
+        return "database title is a reserved Windows filename";
+
+    static const QRegularExpression reservedPort(
+            QStringLiteral("^(com|lpt)[1-9]$"),
+            QRegularExpression::CaseInsensitiveOption);
+    if (reservedPort.match(stem).hasMatch())
+        return "database title is a reserved Windows filename";
+
+    return QString();
+}
+
 class MarkedFileDelegate final : public QStyledItemDelegate
 {
 public:
@@ -157,6 +258,211 @@ public:
 private:
     QFileSystemModel *model;
     const QSet<QString> *marked;
+};
+
+// PS2_HDD_LEFT_ISO_GAME_ID_V3
+QString identifyIsoGameIdFast(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return QString();
+
+    auto readAt = [&](quint64 offset, qsizetype amount) -> QByteArray {
+        if (!file.seek(static_cast<qint64>(offset)))
+            return {};
+        const QByteArray bytes = file.read(amount);
+        return bytes.size() == amount ? bytes : QByteArray();
+    };
+
+    const QByteArray rootLocation = readAt(0x80A4ULL, 2);
+    if (rootLocation.size() != 2)
+        return QString();
+
+    const quint32 rootSector =
+            (static_cast<quint32>(
+                static_cast<unsigned char>(rootLocation[0])) << 8U) |
+            static_cast<quint32>(
+                static_cast<unsigned char>(rootLocation[1]));
+
+    const quint64 rootOffset =
+            static_cast<quint64>(rootSector) * 2048ULL;
+
+    const QByteArray root = readAt(rootOffset, 2048);
+    if (root.size() != 2048)
+        return QString();
+
+    const QByteArray systemCnfName("EM.CNF", 6);
+    const qsizetype cnfIndex = root.indexOf(systemCnfName);
+    if (cnfIndex < 31)
+        return QString();
+
+    const qsizetype extent = cnfIndex - 31;
+    if (extent < 0 || extent + 4 > root.size())
+        return QString();
+
+    const quint32 systemSector =
+            (static_cast<quint32>(
+                static_cast<unsigned char>(root[extent])) << 24U) |
+            (static_cast<quint32>(
+                static_cast<unsigned char>(root[extent + 1])) << 16U) |
+            (static_cast<quint32>(
+                static_cast<unsigned char>(root[extent + 2])) << 8U) |
+            static_cast<quint32>(
+                static_cast<unsigned char>(root[extent + 3]));
+
+    const quint64 systemOffset =
+            static_cast<quint64>(systemSector) * 2048ULL;
+
+    const QByteArray systemCnf = readAt(systemOffset, 64);
+    if (systemCnf.size() != 64)
+        return QString();
+
+    const QByteArray precursor = QByteArray::fromHex("303A5C"); // bytes 30 3A 5C = 0 colon backslash
+    const qsizetype precursorIndex = systemCnf.indexOf(precursor);
+    if (precursorIndex < 0 ||
+            precursorIndex + 3 + 11 > systemCnf.size())
+        return QString();
+
+    const QByteArray idBytes =
+            systemCnf.mid(precursorIndex + 3, 11);
+
+    for (const char ch : idBytes) {
+        const unsigned char value =
+                static_cast<unsigned char>(ch);
+        if (value < 0x20 || value > 0x7e)
+            return QString();
+    }
+
+    return QString::fromLatin1(idBytes).toUpper();
+}
+
+class Ps2FileSystemModel final : public QFileSystemModel
+{
+public:
+    explicit Ps2FileSystemModel(QObject *parent = nullptr)
+        : QFileSystemModel(parent)
+    {
+    }
+
+    int columnCount(
+            const QModelIndex &parent = QModelIndex()) const override
+    {
+        return QFileSystemModel::columnCount(parent) + 1;
+    }
+
+    QVariant headerData(
+            int section,
+            Qt::Orientation orientation,
+            int role = Qt::DisplayRole) const override
+    {
+        if (orientation == Qt::Horizontal &&
+                role == Qt::DisplayRole &&
+                section == 4)
+            return QStringLiteral("Game ID");
+
+        return QFileSystemModel::headerData(
+                section,
+                orientation,
+                role);
+    }
+
+    QVariant data(
+            const QModelIndex &index,
+            int role = Qt::DisplayRole) const override
+    {
+        if (!index.isValid() || index.column() != 4)
+            return QFileSystemModel::data(index, role);
+
+        const QModelIndex nameIndex =
+                index.sibling(index.row(), 0);
+        const QString path =
+                QDir::cleanPath(filePath(nameIndex));
+        const QFileInfo info(path);
+
+        // Intentionally ISO only. OPL internal-HDD HDL games are not CHD.
+        if (!info.isFile() ||
+                info.suffix().compare(
+                    "iso",
+                    Qt::CaseInsensitive) != 0)
+            return QVariant();
+
+        if (role == Qt::ToolTipRole)
+            return QStringLiteral(
+                    "PS2 Game ID read directly from this ISO. "
+                    "Only a few small ISO sectors are read.");
+
+        if (role != Qt::DisplayRole)
+            return QVariant();
+
+        const auto cached = gameIds.constFind(path);
+        if (cached != gameIds.cend())
+            return cached.value().isEmpty()
+                    ? QStringLiteral("Not detected")
+                    : cached.value();
+
+        scheduleGameIdScan(path);
+        return QStringLiteral("Scanning...");
+    }
+
+    void clearGameIdCache()
+    {
+        gameIds.clear();
+        pending.clear();
+        emit layoutChanged();
+    }
+
+private:
+    void scheduleGameIdScan(const QString &path) const
+    {
+        if (pending.contains(path))
+            return;
+
+        pending.insert(path);
+
+        QPointer<Ps2FileSystemModel> self(
+                const_cast<Ps2FileSystemModel *>(this));
+
+        QThreadPool::globalInstance()->start(
+                [self, path]() {
+            const QString id =
+                    identifyIsoGameIdFast(path);
+
+            if (!self)
+                return;
+
+            QMetaObject::invokeMethod(
+                    self,
+                    [self, path, id]() {
+                if (!self)
+                    return;
+
+                self->pending.remove(path);
+                self->gameIds.insert(path, id);
+
+                const QModelIndex sourceIndex =
+                        self->index(path);
+                if (!sourceIndex.isValid())
+                    return;
+
+                const QModelIndex idIndex =
+                        self->index(
+                            sourceIndex.row(),
+                            4,
+                            sourceIndex.parent());
+
+                if (idIndex.isValid())
+                    emit self->dataChanged(
+                            idIndex,
+                            idIndex,
+                            { Qt::DisplayRole,
+                              Qt::ToolTipRole });
+            },
+                    Qt::QueuedConnection);
+        });
+    }
+
+    mutable QHash<QString, QString> gameIds;
+    mutable QSet<QString> pending;
 };
 }
 
@@ -302,6 +608,26 @@ void MainWindow::buildUi()
             -1);
     gameBankCombo->addItem("Bank 0", 0);
     commandBar->addWidget(gameBankCombo);
+
+    renameOnTransferCheck = new QCheckBox(
+            "Auto-rename source files using latest gameid.txt", central);
+    {
+        QSettings transferSettings("VajskiDs", "PS2-HDD-Manager");
+        renameOnTransferCheck->setChecked(
+                transferSettings.value("transfer/renameFromGameId", true).toBool());
+    }
+    renameOnTransferCheck->setToolTip(
+            "At the start of every transfer queue, downloads the current "
+            "gameid.txt from L10N37/PS2-ISO-Batch-Renamer- main. "
+            "The database title is used for the HDL game name and the PC source "
+            "file is renamed only after a successful install or verified exact skip. "
+            "Existing destination files are never overwritten.");
+    connect(renameOnTransferCheck, &QCheckBox::toggled, this, [](bool enabled) {
+        QSettings transferSettings("VajskiDs", "PS2-HDD-Manager");
+        transferSettings.setValue("transfer/renameFromGameId", enabled);
+    });
+    commandBar->addWidget(renameOnTransferCheck);
+
     copyToPs2Button = new QPushButton("F5  Install selected game(s)  →  PS2 HDD", central);
     copyToPs2Button->setShortcut(QKeySequence(QStringLiteral("F5")));
     copyToPs2Button->setToolTip("Installs selected PS2 disc images as normal HDL APA game partitions.");
@@ -374,7 +700,7 @@ QWidget *MainWindow::buildPcPane()
 
     pcPath = new QLineEdit(group);
     layout->addWidget(pcPath);
-    pcModel = new QFileSystemModel(group);
+    pcModel = new Ps2FileSystemModel(group);
     pcModel->setFilter(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::AllDirs);
     pcModel->setRootPath(QString());
     pcView = new QTreeView(group);
@@ -393,7 +719,13 @@ QWidget *MainWindow::buildPcPane()
     pcView->setRootIsDecorated(false);
     pcView->setItemsExpandable(false);
     pcView->header()->setSectionResizeMode(0, QHeaderView::Stretch);
-    for (int i = 1; i < 4; i++) pcView->header()->setSectionResizeMode(i, QHeaderView::ResizeToContents);
+    for (int i = 1; i < 5; i++)
+        pcView->header()->setSectionResizeMode(
+                i,
+                QHeaderView::ResizeToContents);
+    pcView->setToolTip(
+            "The Game ID column uses the PS2 Batch Renamer direct ISO algorithm. "
+            "It intentionally scans ISO files only; CHD is not an OPL HDD game format.");
     layout->addWidget(pcView, 1);
     auto *queueBar = new QHBoxLayout();
     auto *addSelectedToQueue = new QPushButton("Add Selected to Queue", group);
@@ -515,7 +847,11 @@ QWidget *MainWindow::buildPcPane()
         if (directory.cdUp()) navigatePc(directory.absolutePath());
     });
     connect(refresh, &QPushButton::clicked, this, [this]() {
-        populatePcDrives(); navigatePc(pcPath->text());
+        if (auto *model =
+                dynamic_cast<Ps2FileSystemModel *>(pcModel))
+            model->clearGameIdCache();
+        populatePcDrives();
+        navigatePc(pcPath->text());
     });
     return group;
 }
@@ -526,6 +862,16 @@ QWidget *MainWindow::buildPs2Pane()
     auto *layout = new QVBoxLayout(group);
     auto *toolbar = new QHBoxLayout();
     auto *refresh = new QPushButton("Refresh HDD", group);
+    auto *renameGameButton =
+            new QPushButton("Rename Game...", group);
+    auto *fixTitlesButton =
+            new QPushButton("Fix Installed Titles...", group);
+    renameGameButton->setToolTip(
+            "Rename one selected installed HDL game in place. "
+            "The game data is not retransferred.");
+    fixTitlesButton->setToolTip(
+            "Download the current PS2 Batch Renamer gameid.txt and "
+            "rename installed HDL titles in place by their Game IDs.");
     addArtButton = new QPushButton("Add Art...", group);
     addArtButton->setToolTip("Scan installed HDL Game IDs, download matching OPL artwork into the persistent cache, then install it directly into OPL Storage/ART.");
     installAppsButton = new QPushButton("Install / Update OPL Apps...", group);
@@ -537,6 +883,8 @@ QWidget *MainWindow::buildPs2Pane()
             "cover art, write operations, game-list cache, auto-refresh and auto-sort. "
             "IGR exit_path is deliberately left unchanged because direct HDD/PFS IGR return is not safe in stock OPL.");
     toolbar->addWidget(refresh);
+    toolbar->addWidget(renameGameButton);
+    toolbar->addWidget(fixTitlesButton);
     toolbar->addWidget(addArtButton);
     toolbar->addWidget(installAppsButton);
     toolbar->addWidget(applyOplDefaultsButton);
@@ -547,6 +895,7 @@ QWidget *MainWindow::buildPs2Pane()
     ps2View->viewport()->setAcceptDrops(true);
     ps2View->viewport()->installEventFilter(this);
     ps2View->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    ps2View->setContextMenuPolicy(Qt::CustomContextMenu);
     ps2View->setColumnCount(5);
     ps2View->setHeaderLabels({ "Name", "Game ID / Type", "Media", "Size", "Bank" });
     ps2View->header()->setSectionResizeMode(0, QHeaderView::Stretch);
@@ -565,9 +914,47 @@ QWidget *MainWindow::buildPs2Pane()
         if (unlockHddSession(true))
             refreshCurrentPs2Tree();
     });
+    connect(renameGameButton, &QPushButton::clicked,
+            this, &MainWindow::renameSelectedInstalledGame);
+    connect(fixTitlesButton, &QPushButton::clicked,
+            this, [this]() {
+        renameInstalledGamesFromLatestDatabase(true);
+    });
     connect(addArtButton, &QPushButton::clicked, this, &MainWindow::addArtwork);
     connect(installAppsButton, &QPushButton::clicked, this, &MainWindow::installOrUpdateOplApps);
     connect(applyOplDefaultsButton, &QPushButton::clicked, this, &MainWindow::applyRecommendedOplDefaults);
+
+    connect(ps2View, &QTreeWidget::customContextMenuRequested,
+            this, [this](const QPoint &position) {
+        QTreeWidgetItem *item =
+                ps2View->itemAt(position);
+
+        if (!item ||
+                item->data(0, KindRole).toInt() != NodeGame)
+            return;
+
+        if (!item->isSelected()) {
+            ps2View->clearSelection();
+            item->setSelected(true);
+            ps2View->setCurrentItem(item);
+        }
+
+        QMenu menu(ps2View);
+        QAction *manual =
+                menu.addAction("Rename installed game...");
+        QAction *latest =
+                menu.addAction("Rename selected from latest gameid.txt");
+
+        QAction *chosen =
+                menu.exec(
+                    ps2View->viewport()->mapToGlobal(position));
+
+        if (chosen == manual)
+            renameSelectedInstalledGame();
+        else if (chosen == latest)
+            renameInstalledGamesFromLatestDatabase(false);
+    });
+
     connect(ps2View, &QTreeWidget::itemExpanded, this, [this](QTreeWidgetItem *item) {
         if (!item || item->data(0, KindRole).toInt() != NodePfsDirectory ||
                 item->data(0, LoadedRole).toBool())
@@ -1510,6 +1897,646 @@ void MainWindow::installSelectedPcGames()
     installGameFiles(markedOrSelectedPcPaths());
 }
 
+// PS2_HDD_INSTALLED_TITLE_RENAME_V3
+bool MainWindow::fetchLatestGameTitleDatabase(
+        QHash<QString, QString> *titles,
+        QString *error)
+{
+    if (!titles) {
+        if (error)
+            *error = "Internal database target is null.";
+        return false;
+    }
+
+    if (!network) {
+        if (error)
+            *error = "Qt network manager is unavailable.";
+        return false;
+    }
+
+    const QUrl url(
+            "https://raw.githubusercontent.com/L10N37/"
+            "PS2-ISO-Batch-Renamer-/refs/heads/main/gameid.txt");
+
+    QNetworkRequest request(url);
+    request.setHeader(
+            QNetworkRequest::UserAgentHeader,
+            QString("PS2-HDD-Manager/%1")
+                    .arg(PS2_HDD_APP_VERSION));
+    request.setAttribute(
+            QNetworkRequest::RedirectPolicyAttribute,
+            QNetworkRequest::NoLessSafeRedirectPolicy);
+
+    QNetworkReply *reply = network->get(request);
+    QEventLoop loop;
+    QTimer timeout;
+    timeout.setSingleShot(true);
+
+    connect(&timeout,
+            &QTimer::timeout,
+            reply,
+            &QNetworkReply::abort);
+    connect(reply,
+            &QNetworkReply::finished,
+            &loop,
+            &QEventLoop::quit);
+
+    timeout.start(30000);
+    loop.exec();
+    timeout.stop();
+
+    const int status =
+            reply->attribute(
+                QNetworkRequest::HttpStatusCodeAttribute)
+                .toInt();
+    const auto networkError =
+            reply->error();
+    const QString networkErrorText =
+            reply->errorString();
+    const QByteArray data =
+            reply->readAll();
+    reply->deleteLater();
+
+    if (networkError != QNetworkReply::NoError ||
+            status != 200) {
+        if (error) {
+            *error = status
+                    ? QString("HTTP %1").arg(status)
+                    : networkErrorText;
+        }
+        return false;
+    }
+
+    return parseLiveGameIdDatabase(
+            data,
+            titles,
+            error);
+}
+
+bool MainWindow::renameInstalledGameOnHdd(
+        const InstalledGameRef &game,
+        const QString &newName,
+        QString *error)
+{
+#ifdef __linux__
+    const int diskIndex =
+            diskCombo
+                ? diskCombo->currentIndex()
+                : -1;
+
+    if (diskIndex < 0 ||
+            static_cast<std::size_t>(diskIndex) >=
+                disks.size()) {
+        if (error)
+            *error = "No PS2 HDD is selected.";
+        return false;
+    }
+
+    QString title =
+            cleanMachineField(newName);
+
+    if (title.isEmpty() ||
+            title.size() > 159) {
+        if (error)
+            *error =
+                    "HDL title must contain 1-159 characters.";
+        return false;
+    }
+
+    if (title.startsWith('+') ||
+            title.startsWith('*') ||
+            title.startsWith('-') ||
+            title.startsWith(
+                "0x",
+                Qt::CaseInsensitive)) {
+        if (error)
+            *error =
+                    "This title begins with a token that hdl_dump "
+                    "reserves for modify options.";
+        return false;
+    }
+
+    const auto &disk =
+            disks[static_cast<std::size_t>(diskIndex)];
+
+    QString output;
+    const bool ok =
+            runPrivilegedWriter(
+                disk,
+                {
+                    "--hdl-dump", hdlDumpPath,
+                    "--rename-installed", game.name,
+                    "--new-game-name", title,
+                    "--startup-id", game.gameId,
+                    "--bank", QString::number(game.bank)
+                },
+                &output);
+
+    if (!ok) {
+        if (error)
+            *error = output.right(5000).trimmed();
+        return false;
+    }
+
+    if (!output.contains("GAME_RENAMED\t")) {
+        if (error)
+            *error =
+                    "The writer returned success without its "
+                    "post-rename verification record.\n" +
+                    output.right(3000);
+        return false;
+    }
+
+    if (error)
+        error->clear();
+    return true;
+#else
+    Q_UNUSED(game);
+    Q_UNUSED(newName);
+    if (error)
+        *error =
+                "Installed-game renaming is currently Linux/Fedora only.";
+    return false;
+#endif
+}
+
+void MainWindow::renameSelectedInstalledGame()
+{
+#ifdef __linux__
+    if (transferQueueRunning ||
+            hddOperationInProgress ||
+            ps2RefreshInProgress) {
+        QMessageBox::information(
+                this,
+                "HDD operation busy",
+                "Wait for the current PS2 HDD operation to finish.");
+        return;
+    }
+
+    if (!unlockHddSession(true))
+        return;
+
+    QString reason;
+    if (!selectedDiskCanInstallGames(&reason)) {
+        QMessageBox::warning(
+                this,
+                "Installed-game rename unavailable",
+                reason);
+        return;
+    }
+
+    const auto selected =
+            installedGames(true);
+
+    if (selected.size() != 1) {
+        QMessageBox::information(
+                this,
+                "Select one installed game",
+                "Select exactly one installed HDL game to rename.");
+        return;
+    }
+
+    const InstalledGameRef game =
+            selected.front();
+
+    bool accepted = false;
+    QString title =
+            QInputDialog::getText(
+                this,
+                "Rename installed HDL game",
+                QString("%1\n%2 — Bank %3\n\nNew OPL/HDL title:")
+                        .arg(
+                            game.name,
+                            game.gameId)
+                        .arg(game.bank),
+                QLineEdit::Normal,
+                game.name,
+                &accepted);
+
+    if (!accepted)
+        return;
+
+    title = cleanMachineField(title);
+    if (title == game.name)
+        return;
+
+    if (title.isEmpty() ||
+            title.size() > 159) {
+        QMessageBox::warning(
+                this,
+                "Invalid HDL title",
+                "The title must contain 1-159 characters.");
+        return;
+    }
+
+    if (QMessageBox::question(
+                this,
+                "Rename installed game?",
+                QString("Rename in place on Bank %1?\n\n%2\n→\n%3\n\n"
+                        "The game data is not retransferred.")
+                        .arg(game.bank)
+                        .arg(game.name, title),
+                QMessageBox::Yes |
+                    QMessageBox::Cancel,
+                QMessageBox::Cancel) !=
+            QMessageBox::Yes)
+        return;
+
+    statusLabel->setText(
+            QString("Renaming %1 in place...")
+                    .arg(game.name));
+    QApplication::processEvents();
+
+    QString error;
+    if (!renameInstalledGameOnHdd(
+                game,
+                title,
+                &error)) {
+        QMessageBox::critical(
+                this,
+                "Installed-game rename failed",
+                error);
+        return;
+    }
+
+    statusLabel->setText(
+            QString("Renamed %1 → %2. Refreshing HDD game table...")
+                    .arg(game.name, title));
+    refreshCurrentPs2Tree();
+#else
+    QMessageBox::information(
+            this,
+            "Unavailable",
+            "Installed-game renaming is currently Linux/Fedora only.");
+#endif
+}
+
+void MainWindow::renameInstalledGamesFromLatestDatabase(
+        bool allInstalled)
+{
+#ifdef __linux__
+    if (transferQueueRunning ||
+            hddOperationInProgress ||
+            ps2RefreshInProgress) {
+        QMessageBox::information(
+                this,
+                "HDD operation busy",
+                "Wait for the current PS2 HDD operation to finish.");
+        return;
+    }
+
+    if (!unlockHddSession(true))
+        return;
+
+    QString reason;
+    if (!selectedDiskCanInstallGames(&reason)) {
+        QMessageBox::warning(
+                this,
+                "Installed-title correction unavailable",
+                reason);
+        return;
+    }
+
+    const auto targets =
+            installedGames(!allInstalled);
+
+    if (targets.empty()) {
+        QMessageBox::information(
+                this,
+                "No installed games selected",
+                allInstalled
+                    ? "No installed HDL games with Game IDs were found."
+                    : "Select one or more installed HDL games first.");
+        return;
+    }
+
+    statusLabel->setText(
+            "Downloading current PS2 Batch Renamer gameid.txt...");
+    QApplication::processEvents();
+
+    QHash<QString, QString> database;
+    QString databaseError;
+
+    if (!fetchLatestGameTitleDatabase(
+                &database,
+                &databaseError)) {
+        QMessageBox::critical(
+                this,
+                "Latest gameid.txt unavailable",
+                databaseError);
+        return;
+    }
+
+    struct RenamePlan
+    {
+        InstalledGameRef game;
+        QString title;
+    };
+
+    std::vector<RenamePlan> plan;
+    int missing = 0;
+    int alreadyCorrect = 0;
+    int tooLong = 0;
+
+    for (const InstalledGameRef &game : targets) {
+        const QString title =
+                database.value(
+                    game.gameId.toUpper());
+
+        if (title.isEmpty()) {
+            ++missing;
+            continue;
+        }
+
+        if (title == game.name) {
+            ++alreadyCorrect;
+            continue;
+        }
+
+        if (title.size() > 159) {
+            ++tooLong;
+            continue;
+        }
+
+        plan.push_back(
+                { game, title });
+    }
+
+    if (plan.empty()) {
+        QMessageBox::information(
+                this,
+                "Installed titles already current",
+                QString("No installed title needs changing.\n\n"
+                        "Already correct: %1\n"
+                        "Game IDs absent from current database: %2\n"
+                        "Titles over HDL limit: %3")
+                        .arg(alreadyCorrect)
+                        .arg(missing)
+                        .arg(tooLong));
+        return;
+    }
+
+    QStringList preview;
+    const int previewCount =
+            std::min<int>(
+                12,
+                static_cast<int>(plan.size()));
+
+    for (int i = 0; i < previewCount; ++i) {
+        preview <<
+                QString("%1  →  %2  [%3 / Bank %4]")
+                    .arg(
+                        plan[static_cast<std::size_t>(i)].game.name,
+                        plan[static_cast<std::size_t>(i)].title,
+                        plan[static_cast<std::size_t>(i)].game.gameId)
+                    .arg(
+                        plan[static_cast<std::size_t>(i)].game.bank);
+    }
+
+    if (static_cast<int>(plan.size()) >
+            previewCount)
+        preview <<
+                QString("... and %1 more")
+                    .arg(
+                        static_cast<int>(plan.size()) -
+                        previewCount);
+
+    if (QMessageBox::question(
+                this,
+                "Fix installed HDL titles?",
+                QString("Latest live gameid.txt contains %1 Game IDs.\n\n"
+                        "%2 installed title(s) will be renamed in place.\n"
+                        "No game image data will be retransferred.\n\n%3")
+                        .arg(database.size())
+                        .arg(
+                            static_cast<qulonglong>(
+                                plan.size()))
+                        .arg(preview.join('\n')),
+                QMessageBox::Yes |
+                    QMessageBox::Cancel,
+                QMessageBox::Cancel) !=
+            QMessageBox::Yes)
+        return;
+
+    // PS2_HDD_FAST_BATCH_RENAME_V1
+    QSet<int> touchedBanks;
+    for (const RenamePlan &entry : plan)
+        touchedBanks.insert(entry.game.bank);
+
+    QList<int> bankList = touchedBanks.values();
+    std::sort(bankList.begin(), bankList.end());
+
+    QProgressDialog progress(
+            "Fast renaming installed HDL titles...",
+            "Stop before next bank",
+            0,
+            bankList.size(),
+            this);
+    progress.setWindowTitle(
+            "Fix Installed PS2 Game Titles");
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+    progress.setMinimumWidth(760);
+
+    QStringList renamed;
+    QStringList failures;
+    int processedBanks = 0;
+
+    const int diskIndex =
+            diskCombo ? diskCombo->currentIndex() : -1;
+
+    if (diskIndex < 0 ||
+            static_cast<std::size_t>(diskIndex) >=
+                disks.size()) {
+        QMessageBox::critical(
+                this,
+                "Fast installed-title rename failed",
+                "The selected PS2 HDD disappeared before the batch started.");
+        return;
+    }
+
+    const auto &disk =
+            disks[static_cast<std::size_t>(diskIndex)];
+
+    for (const int bank : bankList) {
+        if (progress.wasCanceled())
+            break;
+
+        int bankCount = 0;
+        for (const RenamePlan &entry : plan)
+            if (entry.game.bank == bank)
+                ++bankCount;
+
+        progress.setLabelText(
+                QString("Bank %1: caching Game IDs + APA positions once, then applying %2 metadata rename(s)...")
+                    .arg(bank)
+                    .arg(bankCount));
+        progress.setValue(processedBanks);
+        QApplication::processEvents();
+
+        QTemporaryFile manifest(
+                QDir::tempPath() +
+                "/ps2-hdd-fast-rename-XXXXXX.tsv");
+        manifest.setAutoRemove(true);
+
+        if (!manifest.open()) {
+            failures <<
+                    QString("Bank %1\nCould not create fast rename manifest.")
+                        .arg(bank);
+            break;
+        }
+
+        bool manifestOk = true;
+
+        for (const RenamePlan &entry : plan) {
+            if (entry.game.bank != bank)
+                continue;
+
+            const QString id =
+                    cleanMachineField(entry.game.gameId);
+            const QString oldName =
+                    cleanMachineField(entry.game.name);
+            const QString newName =
+                    cleanMachineField(entry.title);
+
+            const QByteArray line =
+                    (id + '\t' +
+                     oldName + '\t' +
+                     newName + '\n').toUtf8();
+
+            if (manifest.write(line) != line.size()) {
+                manifestOk = false;
+                failures <<
+                        QString("Bank %1\nCould not write fast rename manifest.")
+                            .arg(bank);
+                break;
+            }
+        }
+
+        if (!manifestOk)
+            break;
+
+        if (!manifest.flush()) {
+            failures <<
+                    QString("Bank %1\nCould not flush fast rename manifest.")
+                        .arg(bank);
+            break;
+        }
+
+        QString output;
+        const bool ok =
+                runPrivilegedWriter(
+                    disk,
+                    {
+                        "--hdl-dump", hdlDumpPath,
+                        "--rename-batch-manifest",
+                            manifest.fileName(),
+                        "--bank",
+                            QString::number(bank)
+                    },
+                    &output);
+
+        for (const QString &line :
+                output.split('\n', Qt::SkipEmptyParts)) {
+            if (!line.startsWith("GAME_RENAMED\t"))
+                continue;
+
+            const QStringList fields = line.split('\t');
+            if (fields.size() < 5)
+                continue;
+
+            renamed <<
+                    QString("%1 → %2 [%3 / Bank %4]")
+                        .arg(
+                            cleanMachineField(fields[3]),
+                            cleanMachineField(fields[4]),
+                            cleanMachineField(fields[2]),
+                            cleanMachineField(fields[1]));
+        }
+
+        if (!ok) {
+            failures <<
+                    QString("Bank %1\n%2")
+                        .arg(bank)
+                        .arg(output.right(9000).trimmed());
+            break;
+        }
+
+        ++processedBanks;
+        progress.setValue(processedBanks);
+        QApplication::processEvents();
+    }
+
+    const bool cancelled =
+            progress.wasCanceled();
+    progress.close();
+
+    statusLabel->setText(
+            "Installed-title pass finished. Refreshing HDD game table...");
+    refreshCurrentPs2Tree();
+
+    QString summary =
+            QString("Renamed successfully: %1 / %2\n"
+                    "Already correct: %3\n"
+                    "Missing from latest gameid.txt: %4\n"
+                    "Over HDL title limit: %5")
+                    .arg(renamed.size())
+                    .arg(
+                        static_cast<qulonglong>(
+                            plan.size()))
+                    .arg(alreadyCorrect)
+                    .arg(missing)
+                    .arg(tooLong);
+
+    if (!renamed.isEmpty())
+        summary +=
+                "\n\nRenamed:\n  " +
+                renamed.join("\n  ");
+
+    if (!failures.isEmpty())
+        summary +=
+                "\n\nSTOPPED SAFELY after failure:\n  " +
+                failures.join("\n  ");
+
+    if (cancelled)
+        summary +=
+                "\n\nStopped by user before the next title. "
+                "No in-progress metadata write was interrupted.";
+
+    QDialog resultDialog(this);
+    resultDialog.setWindowTitle(
+            "Installed HDL title results");
+    resultDialog.resize(860, 680);
+
+    auto *layout =
+            new QVBoxLayout(&resultDialog);
+    auto *view =
+            new QPlainTextEdit(&resultDialog);
+    view->setReadOnly(true);
+    view->setPlainText(summary);
+    layout->addWidget(view, 1);
+
+    auto *buttons =
+            new QDialogButtonBox(
+                QDialogButtonBox::Close,
+                &resultDialog);
+    connect(buttons,
+            &QDialogButtonBox::rejected,
+            &resultDialog,
+            &QDialog::reject);
+    layout->addWidget(buttons);
+    resultDialog.exec();
+#else
+    Q_UNUSED(allInstalled);
+    QMessageBox::information(
+            this,
+            "Unavailable",
+            "Installed-game renaming is currently Linux/Fedora only.");
+#endif
+}
+
 std::vector<MainWindow::InstalledGameRef> MainWindow::installedGames(bool selectedOnly) const
 {
     std::vector<InstalledGameRef> result;
@@ -1525,8 +2552,19 @@ std::vector<MainWindow::InstalledGameRef> MainWindow::installedGames(bool select
         if (!item) return;
         const bool thisSelected = parentSelected || selected.contains(item);
         if (item->data(0, KindRole).toInt() == NodeGame && (!selectedOnly || thisSelected)) {
-            const QString id = item->text(1).trimmed().toUpper();
-            if (!id.isEmpty()) result.push_back({ item->text(0), id });
+            const QString id =
+                    item->text(1).trimmed().toUpper();
+            const QRegularExpressionMatch bankMatch =
+                    QRegularExpression(
+                        QStringLiteral("^Bank\\s+(\\d+)$"))
+                        .match(item->text(4).trimmed());
+            const int bank =
+                    bankMatch.hasMatch()
+                        ? bankMatch.captured(1).toInt()
+                        : 0;
+            if (!id.isEmpty())
+                result.push_back(
+                        { item->text(0), id, bank });
         }
         for (int i = 0; i < item->childCount(); ++i)
             visit(item->child(i), thisSelected);
@@ -1537,9 +2575,16 @@ std::vector<MainWindow::InstalledGameRef> MainWindow::installedGames(bool select
     std::sort(result.begin(), result.end(), [](const InstalledGameRef &a, const InstalledGameRef &b) {
         return a.name.compare(b.name, Qt::CaseInsensitive) < 0;
     });
-    result.erase(std::unique(result.begin(), result.end(), [](const InstalledGameRef &a, const InstalledGameRef &b) {
-        return a.gameId == b.gameId;
-    }), result.end());
+    result.erase(
+            std::unique(
+                result.begin(),
+                result.end(),
+                [](const InstalledGameRef &a,
+                        const InstalledGameRef &b) {
+                    return a.gameId == b.gameId &&
+                            a.bank == b.bank;
+                }),
+            result.end());
     return result;
 }
 
@@ -1960,9 +3005,94 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
         QString key;
         QString name;
         QString media;
+        QString gameId;
+        QString databaseTitle;
+        QString renameDestination;
         int bank = 0;
         qulonglong bytes = 0;
     };
+
+    const bool renameFromDatabase =
+            renameOnTransferCheck &&
+            renameOnTransferCheck->isChecked();
+
+    QHash<QString, QString> gameTitleDatabase;
+    if (renameFromDatabase) {
+        if (!network) {
+            QMessageBox::critical(
+                    this,
+                    "Latest gameid.txt unavailable",
+                    "Auto rename is enabled, but the network manager is unavailable. "
+                    "No transfer was started. Untick auto rename to transfer without renaming.");
+            return;
+        }
+
+        const QUrl databaseUrl(
+                "https://raw.githubusercontent.com/L10N37/"
+                "PS2-ISO-Batch-Renamer-/refs/heads/main/gameid.txt");
+
+        statusLabel->setText(
+                "Refreshing the latest PS2 Batch Renamer gameid.txt...");
+        QApplication::processEvents();
+
+        QNetworkRequest request(databaseUrl);
+        request.setHeader(
+                QNetworkRequest::UserAgentHeader,
+                QString("PS2-HDD-Manager/%1").arg(PS2_HDD_APP_VERSION));
+        request.setAttribute(
+                QNetworkRequest::RedirectPolicyAttribute,
+                QNetworkRequest::NoLessSafeRedirectPolicy);
+
+        QNetworkReply *reply = network->get(request);
+        QEventLoop loop;
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        connect(&timeout, &QTimer::timeout, reply, &QNetworkReply::abort);
+        connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+        timeout.start(30000);
+        loop.exec();
+        timeout.stop();
+
+        const int httpStatus =
+                reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QNetworkReply::NetworkError networkError = reply->error();
+        const QString networkErrorText = reply->errorString();
+        const QByteArray databaseBytes = reply->readAll();
+        reply->deleteLater();
+
+        if (networkError != QNetworkReply::NoError || httpStatus != 200) {
+            QMessageBox::critical(
+                    this,
+                    "Latest gameid.txt unavailable",
+                    QString("Auto rename is enabled, but the current gameid.txt could not "
+                            "be downloaded from PS2-ISO-Batch-Renamer-.\n\n%1\n\n"
+                            "No transfer was started. Untick auto rename if you want to "
+                            "transfer without renaming.")
+                            .arg(httpStatus
+                                    ? QString("HTTP %1").arg(httpStatus)
+                                    : networkErrorText));
+            return;
+        }
+
+        QString databaseError;
+        if (!parseLiveGameIdDatabase(
+                    databaseBytes,
+                    &gameTitleDatabase,
+                    &databaseError)) {
+            QMessageBox::critical(
+                    this,
+                    "Latest gameid.txt rejected",
+                    databaseError +
+                    "\n\nNo transfer was started. The live database must validate "
+                    "before automatic renaming is allowed.");
+            return;
+        }
+
+        statusLabel->setText(
+                QString("Latest gameid.txt loaded: %1 audited Game ID(s).")
+                        .arg(gameTitleDatabase.size()));
+        QApplication::processEvents();
+    }
 
     const int fallbackBank = gameBankCombo->currentData().toInt();
 
@@ -1986,9 +3116,51 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
             return false;
         }
 
+        QString gameId;
+        for (const QString &line : probe.split('\n', Qt::SkipEmptyParts)) {
+            const QStringList fields = line.trimmed().split(';');
+            if (fields.size() < 4)
+                continue;
+
+            QString mediaField = fields[0].trimmed();
+            if (mediaField.startsWith("dual-layer "))
+                mediaField.remove(0, QString("dual-layer ").size());
+
+            if (mediaField != "DVD" && mediaField != "CD")
+                continue;
+
+            gameId = cleanMachineField(fields[3]).toUpper();
+            break;
+        }
+
         QString name = info.completeBaseName().trimmed();
         if (name.isEmpty())
             name = "PS2 Game";
+
+        QString databaseTitle;
+        QString renameDestination;
+
+        if (renameFromDatabase && !gameId.isEmpty()) {
+            databaseTitle = gameTitleDatabase.value(gameId);
+
+            if (!databaseTitle.isEmpty()) {
+                const QString filenameError =
+                        portableGameFilenameError(databaseTitle);
+
+                if (filenameError.isEmpty()) {
+                    name = databaseTitle;
+
+                    const QString suffix = info.suffix();
+                    const QString destinationName =
+                            databaseTitle +
+                            (suffix.isEmpty() ? QString() : "." + suffix);
+
+                    renameDestination =
+                            QDir(info.absolutePath()).filePath(destinationName);
+                }
+            }
+        }
+
         if (name.size() > 159)
             name.truncate(159);
 
@@ -1996,6 +3168,9 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
         out->key = normalizedLocalPath(out->path);
         out->name = name;
         out->media = media;
+        out->gameId = gameId;
+        out->databaseTitle = databaseTitle;
+        out->renameDestination = renameDestination;
         out->bank = bank;
         out->bytes = static_cast<qulonglong>(info.size());
         return !out->key.isEmpty();
@@ -2057,10 +3232,15 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
                         "You may keep browsing the PC and add more games while "
                         "this queue runs. New marks join only at safe game boundaries. "
                         "Existing titles are skipped only after startup identity/media "
-                        "and exact hdl_toc/cdvd_info2 size match.")
+                        "and exact hdl_toc/cdvd_info2 size match.%4")
                         .arg(static_cast<qulonglong>(games.size()))
                         .arg(QString::fromStdString(disk.devicePath))
-                        .arg(initialDestinations.join('\n')),
+                        .arg(initialDestinations.join('\n'))
+                        .arg(renameFromDatabase
+                                ? QString("\n\nAuto rename: ON — latest live gameid.txt "
+                                          "(%1 IDs) loaded from PS2 Batch Renamer main.")
+                                      .arg(gameTitleDatabase.size())
+                                : QString("\n\nAuto rename: OFF — source filenames will not change.")),
                 QMessageBox::Yes | QMessageBox::Cancel,
                 QMessageBox::Cancel) != QMessageBox::Yes)
         return;
@@ -2112,6 +3292,67 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
 
     QStringList installedResults;
     QStringList skippedExistingResults;
+    QStringList renamedSourceResults;
+    QStringList renameWarnings;
+
+    auto renameProcessedSource = [&](const Game &game) {
+        if (!renameFromDatabase)
+            return;
+
+        if (game.gameId.isEmpty()) {
+            renameWarnings << QFileInfo(game.path).fileName() +
+                    " — no startup/Game ID reported; source filename left unchanged.";
+            return;
+        }
+
+        if (game.databaseTitle.isEmpty()) {
+            renameWarnings << QFileInfo(game.path).fileName() +
+                    QString(" — %1 is not in the current gameid.txt; source filename left unchanged.")
+                            .arg(game.gameId);
+            return;
+        }
+
+        const QString filenameError =
+                portableGameFilenameError(game.databaseTitle);
+        if (!filenameError.isEmpty()) {
+            renameWarnings << QFileInfo(game.path).fileName() +
+                    " — " + filenameError + "; source filename left unchanged.";
+            return;
+        }
+
+        if (game.renameDestination.isEmpty())
+            return;
+
+        const QString source =
+                QDir::cleanPath(QFileInfo(game.path).absoluteFilePath());
+        const QString destination =
+                QDir::cleanPath(QFileInfo(game.renameDestination).absoluteFilePath());
+
+        if (source == destination) {
+            renamedSourceResults << QFileInfo(source).fileName() +
+                    " — already named correctly";
+            return;
+        }
+
+        if (QFileInfo::exists(destination)) {
+            renameWarnings << QFileInfo(source).fileName() +
+                    " — rename destination already exists: " +
+                    QFileInfo(destination).fileName() +
+                    " (nothing overwritten)";
+            return;
+        }
+
+        QFile sourceFile(source);
+        if (!sourceFile.rename(destination)) {
+            renameWarnings << QFileInfo(source).fileName() +
+                    " — rename failed: " + sourceFile.errorString();
+            return;
+        }
+
+        renamedSourceResults <<
+                QFileInfo(source).fileName() + "  ->  " +
+                QFileInfo(destination).fileName();
+    };
 
     enum class ExistingState
     {
@@ -2472,6 +3713,8 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
                         .arg(game.name)
                         .arg(existing.bank));
 
+            renameProcessedSource(game);
+
             markedPcPaths.remove(game.key);
             queuedPcBanks.remove(game.key);
 
@@ -2652,6 +3895,8 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
                         .arg(game.bank);
             }
 
+            renameProcessedSource(game);
+
             markedPcPaths.remove(game.key);
             queuedPcBanks.remove(game.key);
         }
@@ -2762,6 +4007,16 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
         summary +=
                 "\n\nVerification notes:\n  " +
                 verificationWarnings.join("\n  ");
+
+    if (!renamedSourceResults.isEmpty())
+        summary +=
+                "\n\nSource filenames — latest gameid.txt:\n  " +
+                renamedSourceResults.join("\n  ");
+
+    if (!renameWarnings.isEmpty())
+        summary +=
+                "\n\nSource rename notes (nothing overwritten):\n  " +
+                renameWarnings.join("\n  ");
 
     if (queueAborted)
         summary +=
