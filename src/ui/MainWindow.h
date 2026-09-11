@@ -95,6 +95,8 @@ private:
     void copyPcItemsToPfs(const QStringList &paths, QTreeWidgetItem *target);
     void applyRecommendedOplDefaults();
     void installOrUpdateOplApps();
+    void installHddIgrReturn();
+    void disableHddIgrReturn();
     bool createPfsCopyManifest(const QStringList &paths, const QString &targetPath,
             bool smartOplRoot, QString *manifestPath, int *fileCount, QString *error) const;
     void resetProgress();
@@ -119,6 +121,8 @@ private:
     QProgressBar *transferProgress = nullptr;
     QPushButton *copyToPs2Button = nullptr;
     QPushButton *applyOplDefaultsButton = nullptr;
+    QPushButton *installHddIgrButton = nullptr;
+    QPushButton *disableHddIgrButton = nullptr;
     QPushButton *installAppsButton = nullptr;
     QPushButton *addArtButton = nullptr;
     QPushButton *unlockButton = nullptr;

@@ -1036,14 +1036,27 @@ QWidget *MainWindow::buildPs2Pane()
     applyOplDefaultsButton = new QPushButton("Apply Recommended OPL Defaults", group);
     applyOplDefaultsButton->setToolTip(
             "Writes a plug-and-play conf_opl.cfg: Internal HDD auto-start/default, Apps auto, "
-            "cover art, write operations, game-list cache, auto-refresh and auto-sort. "
-            "IGR exit_path is deliberately left unchanged because direct HDD/PFS IGR return is not safe in stock OPL.");
+            "cover art, write operations, game-list cache, auto-refresh and auto-sort.");
+
+    // PS2_HDD_HDD_IGR_TEST_V1
+    installHddIgrButton = new QPushButton("Install HDD IGR Return (Test)", group);
+    installHddIgrButton->setToolTip(
+            "No format required. Copies the correct OPL payload to IGR.ELF in the current "
+            "OPL PFS partition and sets exit_path to the full HDD/PFS path.");
+
+    disableHddIgrButton = new QPushButton("Disable HDD IGR Return", group);
+    disableHddIgrButton->setToolTip(
+            "Replaces exit_path with Browser so IGR no longer attempts the HDD IGR.ELF. "
+            "The extra IGR.ELF copy is left harmlessly on the OPL partition.");
+
     toolbar->addWidget(refresh);
     toolbar->addWidget(renameGameButton);
     toolbar->addWidget(fixTitlesButton);
     toolbar->addWidget(addArtButton);
     toolbar->addWidget(installAppsButton);
     toolbar->addWidget(applyOplDefaultsButton);
+    toolbar->addWidget(installHddIgrButton);
+    toolbar->addWidget(disableHddIgrButton);
     toolbar->addStretch();
     layout->addLayout(toolbar);
     ps2View = new QTreeWidget(group);
@@ -1079,6 +1092,8 @@ QWidget *MainWindow::buildPs2Pane()
     connect(addArtButton, &QPushButton::clicked, this, &MainWindow::addArtwork);
     connect(installAppsButton, &QPushButton::clicked, this, &MainWindow::installOrUpdateOplApps);
     connect(applyOplDefaultsButton, &QPushButton::clicked, this, &MainWindow::applyRecommendedOplDefaults);
+    connect(installHddIgrButton, &QPushButton::clicked, this, &MainWindow::installHddIgrReturn);
+    connect(disableHddIgrButton, &QPushButton::clicked, this, &MainWindow::disableHddIgrReturn);
 
     connect(ps2View, &QTreeWidget::customContextMenuRequested,
             this, [this](const QPoint &position) {
@@ -5324,6 +5339,453 @@ void MainWindow::installOrUpdateOplApps()
             "The new FHDB HDD Boot Configuration utility starts read-only and exposes Status, Enable, Disable and Verify on the PS2.");
 #else
     QMessageBox::information(this, "Unavailable", "Physical OPL Apps installation is currently Fedora/Linux only.");
+#endif
+}
+
+// PS2_HDD_HDD_IGR_TEST_V1
+void MainWindow::installHddIgrReturn()
+{
+#ifdef __linux__
+    if (transferQueueRunning) {
+        statusBar()->showMessage(
+                "HDD IGR configuration is disabled while the game queue is running.");
+        return;
+    }
+
+    if (!diskCombo ||
+            diskCombo->currentIndex() < 0 ||
+            diskCombo->currentIndex() >= static_cast<int>(disks.size())) {
+        QMessageBox::warning(
+                this,
+                "No HDD selected",
+                "Select the PS2 HDD before installing the IGR return copy.");
+        return;
+    }
+
+    QString reason;
+    if (!selectedDiskCanBrowsePfs(&reason)) {
+        QMessageBox::warning(
+                this,
+                "HDD IGR unavailable",
+                reason);
+        return;
+    }
+
+    if (currentOplPartition.isEmpty() ||
+            currentOplBase.isEmpty()) {
+        refreshCurrentPs2Tree();
+
+        if (currentOplPartition.isEmpty() ||
+                currentOplBase.isEmpty()) {
+            QMessageBox::warning(
+                    this,
+                    "OPL storage not found",
+                    "The manager could not resolve the OPL PFS partition/root on this HDD.");
+            return;
+        }
+    }
+
+    if (!QFileInfo(fetchPayloadsPath).isExecutable()) {
+        QMessageBox::warning(
+                this,
+                "Payload downloader unavailable",
+                "fetch_payloads.sh is not executable. Run prepare_fedora_test.sh once for this source tree.");
+        return;
+    }
+
+    const int diskIndex =
+            diskCombo->currentIndex();
+    const Ps2::PhysicalDiskCandidate &disk =
+            disks[static_cast<std::size_t>(
+                diskIndex)];
+
+    // Use the bank-aware OPL build whenever this physical HDD spans more than
+    // one APA bank. A <=2 TiB disk may use the current official OPL payload.
+    const auto layout =
+            Ps2::HddLayoutPlanner::Plan(
+                disk.size,
+                Ps2::HddLayoutMode::ExtendedApaBanks);
+
+    const QString fetchArgument =
+            layout.valid &&
+                    layout.banks.size() > 1
+                ? QStringLiteral("--opl-extended-apa")
+                : QStringLiteral("--opl");
+
+    statusLabel->setText(
+            "Preparing OPL payload for direct HDD IGR test...");
+    QApplication::processEvents();
+
+    QProcess fetch(this);
+    fetch.setWorkingDirectory(
+            QFileInfo(fetchPayloadsPath).absolutePath());
+    fetch.setProcessChannelMode(
+            QProcess::MergedChannels);
+    fetch.start(
+            fetchPayloadsPath,
+            { fetchArgument });
+
+    if (!fetch.waitForStarted(10000)) {
+        QMessageBox::critical(
+                this,
+                "Could not prepare OPL",
+                fetch.errorString());
+        return;
+    }
+
+    while (fetch.state() != QProcess::NotRunning) {
+        fetch.waitForFinished(100);
+        QApplication::processEvents();
+    }
+
+    const QString fetchOutput =
+            QString::fromLocal8Bit(
+                fetch.readAll());
+
+    if (fetch.exitStatus() != QProcess::NormalExit ||
+            fetch.exitCode() != 0) {
+        QMessageBox::critical(
+                this,
+                "Could not prepare OPL",
+                fetchOutput.right(9000));
+        return;
+    }
+
+    const QString oplElf =
+            runtimePayloadPath +
+            "/opl/OPNPS2LD.ELF";
+
+    if (!QFileInfo::exists(oplElf)) {
+        QMessageBox::critical(
+                this,
+                "OPL payload missing",
+                "The payload fetch completed but OPNPS2LD.ELF was not found.");
+        return;
+    }
+
+    QString pfsBase =
+            currentOplBase;
+
+    if (!pfsBase.startsWith('/'))
+        pfsBase.prepend('/');
+
+    if (!pfsBase.endsWith('/'))
+        pfsBase.append('/');
+
+    // Full HDD/PFS path form used by PS2 HDD launchers:
+    // hdd0:<APA partition>:pfs:/<path to ELF>
+    const QString exitPath =
+            QStringLiteral("hdd0:%1:pfs:%2IGR.ELF")
+                .arg(
+                    currentOplPartition,
+                    pfsBase);
+
+    Ps2::OplPresetOptions preset;
+    preset.enableApps = true;
+    preset.exitPath =
+            exitPath.toStdString();
+
+    const QByteArray cfg =
+            QByteArray::fromStdString(
+                Ps2::OplConfig::BuildInternalHddPreset(
+                    preset));
+
+    QTemporaryFile cfgFile(
+            QDir::tempPath() +
+            "/ps2-hdd-igr-conf-XXXXXX");
+
+    if (!cfgFile.open()) {
+        QMessageBox::critical(
+                this,
+                "Could not prepare IGR config",
+                cfgFile.errorString());
+        return;
+    }
+
+    if (cfgFile.write(cfg) != cfg.size() ||
+            !cfgFile.flush()) {
+        QMessageBox::critical(
+                this,
+                "Could not prepare IGR config",
+                cfgFile.errorString());
+        return;
+    }
+
+    const QString cfgPath =
+            cfgFile.fileName();
+    cfgFile.close();
+
+    QTemporaryFile manifestFile(
+            QDir::tempPath() +
+            "/ps2-hdd-igr-manifest-XXXXXX");
+
+    if (!manifestFile.open()) {
+        QMessageBox::critical(
+                this,
+                "Could not prepare IGR manifest",
+                manifestFile.errorString());
+        return;
+    }
+
+    QTextStream manifest(
+            &manifestFile);
+
+    manifest
+            << "F\t"
+            << oplElf
+            << "\t"
+            << joinPfsPath(
+                   currentOplBase,
+                   "IGR.ELF")
+            << "\n";
+
+    manifest
+            << "F\t"
+            << cfgPath
+            << "\t"
+            << joinPfsPath(
+                   currentOplBase,
+                   "conf_opl.cfg")
+            << "\n";
+
+    manifest.flush();
+
+    if (!manifestFile.flush()) {
+        QMessageBox::critical(
+                this,
+                "Could not prepare IGR manifest",
+                manifestFile.errorString());
+        return;
+    }
+
+    const QString manifestPath =
+            manifestFile.fileName();
+    manifestFile.close();
+
+    const auto answer =
+            QMessageBox::warning(
+                this,
+                "Install experimental HDD IGR return?",
+                QString(
+                    "This does NOT format the HDD.\n\n"
+                    "It will:\n"
+                    "  • copy the current OPL ELF to %1\n"
+                    "  • set OPL exit_path to:\n"
+                    "    %2\n\n"
+                    "Use 'Disable HDD IGR Return' to return IGR to Browser if the test fails.\n\n"
+                    "Continue?")
+                    .arg(
+                        joinPfsPath(
+                            currentOplBase,
+                            "IGR.ELF"),
+                        exitPath),
+                QMessageBox::Yes |
+                    QMessageBox::Cancel,
+                QMessageBox::Cancel);
+
+    if (answer != QMessageBox::Yes)
+        return;
+
+    transferProgress->setRange(
+            0,
+            0);
+    transferProgress->setVisible(
+            true);
+    progressDetail->setText(
+            "Installing HDD IGR return copy and OPL exit_path...");
+    progressDetail->setVisible(
+            true);
+
+    QString output;
+    const bool ok =
+            runPrivilegedWriter(
+                disk,
+                {
+                    "--pfsshell",
+                    pfsshellPath,
+                    "--copy-manifest",
+                    manifestPath,
+                    "--partition",
+                    currentOplPartition
+                },
+                &output);
+
+    resetProgress();
+
+    if (!ok) {
+        QMessageBox::critical(
+                this,
+                "HDD IGR installation failed",
+                output.right(9000));
+        return;
+    }
+
+    refreshCurrentPs2Tree();
+
+    statusLabel->setText(
+            "HDD IGR return installed for hardware testing.");
+
+    QMessageBox::information(
+            this,
+            "HDD IGR test installed",
+            QString(
+                "IGR.ELF and conf_opl.cfg were written successfully.\n\n"
+                "Configured exit_path:\n%1\n\n"
+                "Test the normal OPL IGR combo from a game. "
+                "If it does not return to OPL, reconnect the HDD to this manager "
+                "and use 'Disable HDD IGR Return'.")
+                .arg(exitPath));
+#else
+    QMessageBox::information(
+            this,
+            "Unavailable",
+            "Physical HDD IGR installation is currently Fedora/Linux only.");
+#endif
+}
+
+void MainWindow::disableHddIgrReturn()
+{
+#ifdef __linux__
+    if (transferQueueRunning) {
+        statusBar()->showMessage(
+                "HDD IGR configuration is disabled while the game queue is running.");
+        return;
+    }
+
+    if (!diskCombo ||
+            diskCombo->currentIndex() < 0 ||
+            diskCombo->currentIndex() >= static_cast<int>(disks.size())) {
+        QMessageBox::warning(
+                this,
+                "No HDD selected",
+                "Select the PS2 HDD before disabling the IGR return.");
+        return;
+    }
+
+    QString reason;
+    if (!selectedDiskCanBrowsePfs(&reason)) {
+        QMessageBox::warning(
+                this,
+                "HDD IGR unavailable",
+                reason);
+        return;
+    }
+
+    if (currentOplPartition.isEmpty() ||
+            currentOplBase.isEmpty()) {
+        refreshCurrentPs2Tree();
+
+        if (currentOplPartition.isEmpty() ||
+                currentOplBase.isEmpty()) {
+            QMessageBox::warning(
+                    this,
+                    "OPL storage not found",
+                    "The manager could not resolve the OPL PFS partition/root on this HDD.");
+            return;
+        }
+    }
+
+    const Ps2::PhysicalDiskCandidate &disk =
+            disks[static_cast<std::size_t>(
+                diskCombo->currentIndex())];
+
+    Ps2::OplPresetOptions preset;
+    preset.enableApps = true;
+
+    // "Browser" is explicitly recognized by OPL's EE core as no custom
+    // exit ELF. The unused IGR.ELF can remain on PFS and is harmless.
+    preset.exitPath = "Browser";
+
+    const QByteArray cfg =
+            QByteArray::fromStdString(
+                Ps2::OplConfig::BuildInternalHddPreset(
+                    preset));
+
+    QTemporaryFile cfgFile(
+            QDir::tempPath() +
+            "/ps2-hdd-igr-disable-conf-XXXXXX");
+
+    if (!cfgFile.open() ||
+            cfgFile.write(cfg) != cfg.size() ||
+            !cfgFile.flush()) {
+        QMessageBox::critical(
+                this,
+                "Could not prepare revert config",
+                cfgFile.errorString());
+        return;
+    }
+
+    const QString cfgPath =
+            cfgFile.fileName();
+    cfgFile.close();
+
+    QTemporaryFile manifestFile(
+            QDir::tempPath() +
+            "/ps2-hdd-igr-disable-manifest-XXXXXX");
+
+    if (!manifestFile.open()) {
+        QMessageBox::critical(
+                this,
+                "Could not prepare revert manifest",
+                manifestFile.errorString());
+        return;
+    }
+
+    QTextStream manifest(
+            &manifestFile);
+
+    manifest
+            << "F\t"
+            << cfgPath
+            << "\t"
+            << joinPfsPath(
+                   currentOplBase,
+                   "conf_opl.cfg")
+            << "\n";
+
+    manifest.flush();
+    manifestFile.flush();
+
+    const QString manifestPath =
+            manifestFile.fileName();
+    manifestFile.close();
+
+    QString output;
+    const bool ok =
+            runPrivilegedWriter(
+                disk,
+                {
+                    "--pfsshell",
+                    pfsshellPath,
+                    "--copy-manifest",
+                    manifestPath,
+                    "--partition",
+                    currentOplPartition
+                },
+                &output);
+
+    if (!ok) {
+        QMessageBox::critical(
+                this,
+                "HDD IGR revert failed",
+                output.right(9000));
+        return;
+    }
+
+    statusLabel->setText(
+            "HDD IGR return disabled; OPL exit_path is Browser.");
+
+    QMessageBox::information(
+            this,
+            "HDD IGR disabled",
+            "OPL exit_path is now Browser.\n\n"
+            "IGR.ELF was deliberately left on the HDD; it is unused and can be "
+            "overwritten by a later test without reformatting.");
+#else
+    QMessageBox::information(
+            this,
+            "Unavailable",
+            "Physical HDD IGR configuration is currently Fedora/Linux only.");
 #endif
 }
 
