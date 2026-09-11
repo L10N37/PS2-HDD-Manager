@@ -3618,6 +3618,88 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
     for (const Game &game : games)
         totalBytes += game.bytes;
 
+    // PS2_HDD_QUEUE_CAPACITY_WARNING_V1
+    //
+    // Give the user an immediate warning when the selected source set cannot
+    // possibly fit on the physical HDD. This is intentionally a preflight
+    // warning, not an allocator policy change: AUTO behaviour is untouched.
+    //
+    // The APA estimate rounds each title up to the same 128 MiB allocation
+    // granularity used by the queue planner and includes the small HDL
+    // metadata allowance. PS2 system/OPL partitions consume still more space,
+    // so the physical disk size is an optimistic upper bound.
+    constexpr qulonglong QueueWarningMiB =
+            1024ULL * 1024ULL;
+    constexpr qulonglong QueueWarningChunk =
+            128ULL * QueueWarningMiB;
+
+    qulonglong estimatedApaBytes = 0;
+
+    for (const Game &game : games) {
+        const qulonglong imageMiB =
+                (game.bytes + QueueWarningMiB - 1ULL) /
+                QueueWarningMiB;
+
+        const qulonglong allocationMiB =
+                ((imageMiB + 4ULL + 127ULL) /
+                 128ULL) *
+                128ULL;
+
+        const qulonglong allocationBytes =
+                allocationMiB *
+                QueueWarningMiB;
+
+        if (std::numeric_limits<qulonglong>::max() -
+                estimatedApaBytes <
+                allocationBytes) {
+            estimatedApaBytes =
+                    std::numeric_limits<qulonglong>::max();
+            break;
+        }
+
+        estimatedApaBytes += allocationBytes;
+    }
+
+    const qulonglong minimumRequiredBytes =
+            std::max(
+                totalBytes,
+                estimatedApaBytes);
+
+    if (minimumRequiredBytes > disk.size) {
+        const qulonglong shortfall =
+                minimumRequiredBytes -
+                disk.size;
+
+        const QString warning =
+                QString(
+                    "The selected game queue cannot fit on this HDD as one "
+                    "complete set.\n\n"
+                    "Queued source images: %1\n"
+                    "Minimum estimated APA allocation: %2\n"
+                    "Physical HDD capacity: %3\n"
+                    "Minimum shortfall: %4\n\n"
+                    "PS2 system, FHDB/OPL and APA metadata also consume HDD "
+                    "space, so actual game capacity is lower than the raw "
+                    "physical capacity shown above.\n\n"
+                    "Continue anyway? AUTO can install games until available "
+                    "capacity is exhausted; games that do not fit will remain "
+                    "uninstalled/reported.")
+                    .arg(formatBytes(totalBytes))
+                    .arg(formatBytes(estimatedApaBytes))
+                    .arg(formatBytes(disk.size))
+                    .arg(formatBytes(shortfall));
+
+        if (QMessageBox::warning(
+                    this,
+                    "Queued games exceed HDD capacity",
+                    warning,
+                    QMessageBox::Yes |
+                        QMessageBox::Cancel,
+                    QMessageBox::Cancel) !=
+                QMessageBox::Yes)
+            return;
+    }
+
     qulonglong completedBytes = 0;
     qulonglong newlyInstalledBytes = 0;
 
