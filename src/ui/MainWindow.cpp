@@ -4071,6 +4071,7 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
                 : 0;
 
     // PS2_HDD_AUTO_SPACE_CACHE_V1
+    // PS2_HDD_AUTO_SPACE_CACHE_V2
     //
     // For a fresh/sequential APA bank, all remaining free chunks normally form
     // one contiguous tail. The first AUTO query remains a real native-APA
@@ -4171,6 +4172,51 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
                 *error =
                         "Could not calculate AUTO queue allocation chunks.";
             return false;
+        }
+
+        // PS2_HDD_AUTO_SPACE_CACHE_V2
+        // V1 can drift slightly after hundreds of installs. Keep its fast
+        // in-RAM path for most of the bank, but make the final 128 GiB
+        // authoritative again so AUTO rolls to the next bank before hdl_dump
+        // can hit RET_NO_SPACE.
+        constexpr int LiveTailRecheckChunks = 1024; // 128 GiB
+        constexpr int LiveFitGuardChunks = 32;      // 4 GiB
+
+        const bool nearBankEnd =
+                state.fit.free <=
+                    LiveTailRecheckChunks ||
+                required +
+                    LiveFitGuardChunks >=
+                    state.fit.free;
+
+        if (nearBankEnd) {
+            BankFit live;
+
+            statusBar()->showMessage(
+                    QString(
+                        "AUTO: live APA capacity recheck for Bank %1 "
+                        "(cached %2 free chunks, %3 required)...")
+                        .arg(bank)
+                        .arg(state.fit.free)
+                        .arg(required));
+            QApplication::processEvents();
+
+            if (!queryBankFit(
+                        bank,
+                        bytes,
+                        &live,
+                        error))
+                return false;
+
+            state.fit = live;
+            state.contiguousTail =
+                    live.free ==
+                    live.largest;
+
+            if (fit)
+                *fit = live;
+
+            return true;
         }
 
         BankFit cached =
