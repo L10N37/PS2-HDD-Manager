@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/ps2-hdd-manager">
+        <file alias="app-icon.png">ps2-hdd-manager.png</file>
+    </qresource>
+</RCC>

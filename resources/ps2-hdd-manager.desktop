@@ -3,6 +3,6 @@ Type=Application
 Name=PS2 HDD Manager
 Comment=Prepare and manage PlayStation 2 APA/PFS hard drives
 Exec=PS2-HDD-Manager
-Icon=drive-harddisk
+Icon=ps2-hdd-manager
 Terminal=false
 Categories=Utility;System;FileTools;

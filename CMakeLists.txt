@@ -52,6 +52,7 @@ if(PS2_HDD_BUILD_GUI)
         qt_standard_project_setup()
         set(PS2_HDD_GUI_SOURCES
             src/main.cpp
+            resources/ps2-hdd-manager.qrc
             src/ui/FhdbConfigDialog.cpp
             src/ui/FhdbConfigDialog.h
             src/ui/MainWindow.cpp
@@ -66,6 +67,8 @@ if(PS2_HDD_BUILD_GUI)
         if(WIN32)
             set(PS2_HDD_MANIFEST_PATH
                 "${CMAKE_CURRENT_SOURCE_DIR}/resources/ps2-hdd-manager.manifest")
+            set(PS2_HDD_ICON_PATH
+                "${CMAKE_CURRENT_SOURCE_DIR}/resources/ps2-hdd-manager.ico")
             configure_file(resources/ps2-hdd-manager.rc.in
                 ${CMAKE_CURRENT_BINARY_DIR}/ps2-hdd-manager.rc @ONLY)
             list(APPEND PS2_HDD_GUI_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/ps2-hdd-manager.rc)
@@ -89,6 +92,8 @@ if(PS2_HDD_BUILD_GUI)
             include(GNUInstallDirs)
             install(FILES resources/ps2-hdd-manager.desktop
                 DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+            install(FILES resources/ps2-hdd-manager.png
+                DESTINATION ${CMAKE_INSTALL_DATADIR}/pixmaps)
         endif()
     else()
         message(STATUS "Qt 6.5+ was not found; building the PS2 core and tests only.")
@@ -96,3 +101,5 @@ if(PS2_HDD_BUILD_GUI)
 endif()
 
 # PS2_HDD_RELEASE_020_RC_V1
+
+# PS2_HDD_APP_ICON_PS2_V2
