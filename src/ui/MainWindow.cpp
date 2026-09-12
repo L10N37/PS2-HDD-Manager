@@ -595,12 +595,19 @@ public:
 
         gameIdScanEnabled = enabled;
 
-        // Any in-flight workers from the previous state are stale.
+        // PS2_HDD_GAME_ID_SCAN_PC_ONLY_V2
+        // This switch belongs exclusively to the PC QFileSystemModel.
+        // Do NOT emit layoutChanged() here: that is a broad structural-model
+        // notification for a state change that only affects Game-ID display
+        // data. The toolbar handler already repaints the PC viewport, while
+        // individual async Game-ID completions emit targeted dataChanged().
+        //
+        // Keeping this non-structural also prevents the PC-side scan toggle
+        // from disturbing selection/state elsewhere in MainWindow, including
+        // the populated PS2 HDD pane.
         ++scanGeneration;
         gameIds.clear();
         pending.clear();
-
-        emit layoutChanged();
     }
 
     bool isGameIdScanEnabled() const
