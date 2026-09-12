@@ -62,6 +62,7 @@ int main(int argc, char *argv[])
     QCoreApplication::setApplicationName("PS2 HDD Manager");
     QCoreApplication::setApplicationVersion(PS2_HDD_APP_VERSION);
     QCoreApplication::setOrganizationName("L10N37");
+    QGuiApplication::setDesktopFileName("ps2-hdd-manager");
     application.setWindowIcon(QIcon(":/ps2-hdd-manager/app-icon.png"));
     QApplication::setStyle(QStyleFactory::create("Fusion"));
 

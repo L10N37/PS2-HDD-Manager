@@ -94,6 +94,8 @@ if(PS2_HDD_BUILD_GUI)
                 DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
             install(FILES resources/ps2-hdd-manager.png
                 DESTINATION ${CMAKE_INSTALL_DATADIR}/pixmaps)
+            install(FILES resources/ps2-hdd-manager.png
+                DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/256x256/apps)
         endif()
     else()
         message(STATUS "Qt 6.5+ was not found; building the PS2 core and tests only.")
@@ -103,3 +105,5 @@ endif()
 # PS2_HDD_RELEASE_020_RC_V1
 
 # PS2_HDD_APP_ICON_PS2_V2
+
+# PS2_HDD_KDE_WAYLAND_ICON_V3
