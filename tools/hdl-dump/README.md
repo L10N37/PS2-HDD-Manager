@@ -1,5 +1,20 @@
 # hdl-dump backend
 
-`prepare_fedora_test.sh` clones and builds the maintained `ps2homebrew/hdl-dump` command-line tool
-at the pinned revision used by PS2 HDD Manager 0.1.0-alpha, then places the executable in `bin/`.
-The GUI invokes it only through `PS2-HDD-Writer`, which repeats the target disk safety checks first.
+Upstream:
+
+https://github.com/ps2homebrew/hdl-dump
+
+Pinned commit:
+
+`32c296c69cf9c263fcbe035004aa28c345b3b279`
+
+PS2 HDD Manager's Fedora preparation path applies:
+
+- `banked-hio-v1` — Extended APA bank-relative host I/O;
+- `scan-progress-v2` — progress during large populated HDL/APA scans;
+- `rename-self-collision-v1` — safe title-only rename/self-collision handling.
+
+This is therefore a **modified pinned hdl-dump backend**, not a stock binary.
+
+Raw physical-disk operations are launched through `PS2-HDD-Writer`, which performs the manager's
+target validation before invoking backend operations.

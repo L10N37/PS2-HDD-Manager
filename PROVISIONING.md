@@ -1,4 +1,4 @@
-# 0.1.0-alpha provisioning
+# v0.2.0 provisioning
 
 All application selections are optional. The format operation always creates and verifies the standard
 APA/PFS system layout first, then performs the selected provisioning transaction.
@@ -62,11 +62,28 @@ installed normally.
 
 ### IGR / exit path
 
-The initial alpha deliberately does not manufacture a direct HDD `exit_path`. Current OPL's EE IGR path loads a
-custom exit ELF with `LoadElf()` after an IOP reset, but only initializes basic modules (and USB modules
-for a `mass:` target); it does not initialize HDD/PFS first. Until a tested HDD-return loader is added,
-leaving `exit_path` unset is safer than generating a broken `hdd0:...:pfs:` return path.
+Direct HDD IGR return is hardware-validated on the managed `PP.FHDB.APPS` layout.
 
+Fresh HDD setup includes **Install HDD IGR Return (recommended)** and it is pre-ticked by default
+when OPL and the recommended OPL configuration are enabled.
+
+Provisioning installs the matching OPL build as:
+
+```text
+/OPL/OPNPS2LD.ELF
+/OPL/IGR.ELF
+```
+
+and writes:
+
+```ini
+exit_path=hdd0:PP.FHDB.APPS:pfs:/OPL/IGR.ELF
+```
+
+On >2 TiB Extended APA disks, both copies are the matching Extended APA-aware OPL build.
+
+Existing formatted HDDs can add the same configuration with **Install HDD IGR Return**.
+**Disable HDD IGR Return** restores `exit_path=Browser`; no reformat is required.
 ## Additional preconfigured OPL Apps
 
 ### wLaunchELF ISR

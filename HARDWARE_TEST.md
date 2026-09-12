@@ -169,3 +169,15 @@ The writer must still require the exact `ERASE /dev/sdX` confirmation and verify
 before reporting success.
 
 Do not enable or test the >2 TiB physical writer yet.
+
+
+<!-- V020_STABLE_4TB_VALIDATION -->
+## v0.2.0 stable 4 TB validation
+
+Hardware candidate: **Toshiba X300 4 TB** (3.64 TiB host-visible), populated with **1,274 games**.
+
+Validated: Bank 0 / Bank 1 operation, AUTO rollover, FHDB/OPL boot flow, installed-title/cache fixes,
+large-library artwork handling and direct HDD IGR return to
+`hdd0:PP.FHDB.APPS:pfs:/OPL/IGR.ELF`.
+
+Recorded artwork pass: 5,000 files installed (3,274 downloaded, 1,726 reused from cache).

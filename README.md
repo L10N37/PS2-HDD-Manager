@@ -1,31 +1,32 @@
 # PS2 HDD Manager
 
-A desktop HDD manager and formatter for PlayStation 2 APA/PFS storage.
+A desktop HDD manager, formatter and provisioning tool for PlayStation 2 APA/PFS storage.
 
-The current alpha focuses on **Linux/Fedora** and adds experimental **Extended APA** support for internal HDDs larger than 2 TiB while keeping Bank 0 compatible with the normal PS2 APA/PFS/FHDB layout.
+**Current release: v0.2.0**
 
-## Hardware-tested status
+Fedora/Linux is the hardware-validated platform. Windows physical-HDD workflows remain experimental.
 
-**Linux/Fedora: tested on real PlayStation 2 hardware.**
+## v0.2.0 — 4 TB / Extended APA hardware validation
 
-Validated with a 4 TB HDD:
+v0.2.0 was validated on a **Toshiba X300 4 TB HDD** (3.64 TiB visible to the host) populated with
+**1,274 PS2 games**.
 
-- FHDB boot from Bank 0
-- normal Bank 0 APA/PFS storage
-- HDL game installation and launch from Bank 0
-- HDL game installation and launch from Bank 1
-- multiple games installed consecutively without stalling between titles
-- mixed-bank transfer queue: queued titles can target Bank 0 or Bank 1 in one unattended run
-- persistent red transfer marks / queue
-- separate overall and current-game progress bars
-- OPL artwork stored in Bank 0 and used by upper-bank games
-- automatic installation of the matching Extended APA OPL build during >2 TiB setup
+Validated on real PS2 hardware:
 
-**Windows:** build support exists, but physical-HDD formatting/install workflows are **not yet hardware-tested**. Treat Windows support in this alpha as experimental.
+- FHDB boots from Bank 0;
+- Bank 0 and Bank 1 HDL game installation and launch;
+- **AUTO Bank 0 -> Bank 1 rollover** when Bank 0 reaches capacity;
+- rapid detection/skip of already-installed exact games when a large queue is resumed;
+- Extended APA-aware OPL on the >2 TiB layout;
+- installed-title fixes plus OPL `games.bin` invalidation/rebuild;
+- direct HDD IGR return to a second OPL copy on the existing HDD;
+- fresh-format provisioning with HDD IGR return enabled by default;
+- Bank-0 OPL artwork shared across the multi-bank game set.
+- Native PS2-themed application icon on Qt, KDE/Wayland and Windows builds;
 
 ## Extended APA
 
-Large disks are split into independent APA banks.
+Large HDDs are represented as independent APA banks:
 
 ```text
 Bank 0 physical base: 0x000000000
@@ -36,71 +37,135 @@ Bank 2 physical base: 0x200000000
 physical_lba = (bank_index * 0x100000000) + bank_relative_lba
 ```
 
-Bank 0 remains the boot/system bank and can contain FHDB, PFS data, OPL data, artwork and games. Bank 1+ are intended for HDL games.
+Bank 0 remains the boot/system bank and contains FHDB, normal PFS application/configuration storage,
+artwork and games. Bank 1+ are games-only APA banks.
 
-For >2 TiB layouts the manager installs the matching public loader automatically:
+The manager uses the matching Extended APA-aware OPL build for multi-bank disks:
 
-**Open PS2 Loader Extended APA**
-`L10N37/Open-PS2-Loader-Extended-APA`
+https://github.com/L10N37/Open-PS2-Loader-Extended-APA
+
+Current pinned Extended APA loader family:
+
 `v1.2.0-Beta-2273-Extended-APA-1`
 
-The downloaded ELF is pinned and SHA-256 verified by the manager.
+Upstream Open PS2 Loader:
+
+https://github.com/ps2homebrew/Open-PS2-Loader
 
 ## Transfer queue
 
-Choose a destination bank before marking games.
+The PC pane supports a persistent marked queue and explicit-bank or **AUTO** placement.
 
-- Right-click toggles a persistent red queue mark.
-- **Add Selected to Queue** adds the current selection.
-- Change the bank selector and add more titles to queue them for another bank.
-- **Unmark All** clears the queue.
-- F5 starts the queue.
-- New titles can also be appended while a transfer is running.
-- Each queued title keeps its own destination bank.
-- The manager performs a fresh bank scan between titles to avoid stale APA/hdl_dump state.
+Large queues cache installed-game identities and use targeted post-install verification instead of
+performing full all-bank destination scans for every title.
+
+AUTO capacity accounting stays fast through the normal part of a bank, then switches back to an
+authoritative live APA check near the bank boundary. This prevents accumulated allocation-estimate
+drift from attempting to place another title in a bank that is actually full.
+
+If the queued source set cannot fit on the physical HDD, the manager warns before the transfer starts.
+
+## HDD IGR return
+
+Fresh formatting/provisioning includes this option, enabled by default:
+
+```text
+[x] Install HDD IGR Return (recommended)
+```
+
+The same matching OPL build is installed as:
+
+```text
+hdd0:PP.FHDB.APPS:pfs:/OPL/OPNPS2LD.ELF
+hdd0:PP.FHDB.APPS:pfs:/OPL/IGR.ELF
+```
+
+and the manager writes:
+
+```ini
+exit_path=hdd0:PP.FHDB.APPS:pfs:/OPL/IGR.ELF
+```
+
+On >2 TiB disks, both copies are the matching Extended APA-aware OPL build.
+
+Existing formatted HDDs can add or revert the same feature with:
+
+- **Install HDD IGR Return**
+- **Disable HDD IGR Return**
+
+No reformat is required.
+
+## PC Game ID / file pane
+
+The PC pane has an optional **Scan Game IDs** checkbox.
+
+- Off: the Game ID column remains blank and no ISO/folder probes run.
+- On: the current directory is scanned asynchronously.
+- Entering another directory scans it while the option remains enabled.
+- Folder probing is intentionally non-recursive.
+- Disabling scanning invalidates stale in-flight results.
+
+The Date Modified column uses padded `MM/dd/yy` dates and the metadata columns use explicit spacing.
+
+Game-ID/title work is shared with:
+
+https://github.com/L10N37/PS2-ISO-Batch-Renamer-
+
+## OPL artwork
+
+Artwork source:
+
+https://github.com/Luden02/psx-ps2-opl-art-database
+
+The source repository documents itself as a preserved dump of the OPL Manager GameArt database:
+
+https://oplmanager.com/
+
+Recorded large-library validation pass:
+
+- **5,000 ART files installed**
+- **3,274 downloaded**
+- **1,726 reused from cache**
+- optional screenshots absent from the source database reported separately
+- genuine unavailable/download failures reported separately
+
+Artwork/media rights remain with their respective owners.
+
+## Modified host backends
+
+PS2 HDD Manager uses **modified pinned builds**, not stock binaries, of:
+
+- hdl-dump — https://github.com/ps2homebrew/hdl-dump
+- pfsshell — https://github.com/ps2homebrew/pfsshell
+
+Exact pinned commits and local patch descriptions are documented in:
+
+- `tools/hdl-dump/README.md`
+- `tools/pfsshell/README.md`
+- `THIRD_PARTY_NOTICES.md`
+
+## Provisioning
+
+The manager can provision/update OPL, FHDB resources, wLaunchELF ISR, Memory Card Annihilator,
+FHDB HDD Boot Configuration, recommended OPL settings, HDD IGR return and OPL artwork.
+
+See `PROVISIONING.md`.
 
 ## Building on Fedora
 
 ```bash
+./prepare_fedora_test.sh --skip-packages
 ./build_fedora.sh
-```
-
-Run:
-
-```bash
 ./build/fedora/PS2-HDD-Manager
 ```
 
-Build and run:
+## Credits and third-party notices
 
-```bash
-./build_fedora.sh --run
-```
+See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
-## Warning
+## Safety
 
-This is an **alpha** release which performs raw writes to physical disks.
+PS2 HDD Manager performs raw writes to physical disks. Verify the selected target device before
+formatting or installing and keep backups of important data.
 
-Double-check the selected device before formatting or installing anything. Keep backups of data you care about. Extended APA requires the matching Extended APA-aware OPL build for games stored above Bank 0.
-
-<!-- V011_ALPHA_STATUS_START -->
-## v0.1.1-alpha status
-
-`v0.1.1-alpha` is the current **pre-release reliability baseline**.
-
-The previous `v0.1.0-alpha` release was a proof-of-concept / early hardware-validation build. The new alpha has been stress-tested on a heavily populated 2 TB HDD with a 602-title queue: **602/602 processed, 601 newly installed and 1 exact existing title safely skipped**.
-
-The stress run took roughly **16 hours at 40-60 MiB/s** on the test setup. That is a known performance problem, not a target: conservative manager-side checks currently repeat too much work between games as the APA chain grows.
-
-### Next branch roadmap
-
-The next development branch focuses on three major areas:
-
-- **Transfer preflight / performance:** inventory source games and destination banks once, optionally check duplicates once, calculate the complete AUTO bank plan once, then execute the queue without repeated manager-side full scans between titles.
-- **PS2 Batch Renamer integration:** reuse the audited PS2 title/game-ID database and ISO/CHD identification logic from `L10N37/PS2-ISO-Batch-Renamer-` (`v4.0.1`) so users can optionally auto-rename before transfer, detect duplicate IDs and use the database without being forced to rename files.
-- **Automatic PS1 POPS / POPStarter setup:** reserve/configure Bank 0 POPS storage during HDD setup, provide selectable reserve sizes, validate user-supplied proprietary runtime files, prepare VCD installs, detect disc IDs and skip existing exact matches.
-
-Artwork handling will also become destination-aware so already-present ART can be skipped before unnecessary downloads/writes.
-
-See `docs/releases/v0.1.1-alpha.md` for the detailed release status and roadmap.
-<!-- V011_ALPHA_STATUS_END -->
+Windows physical-HDD workflows have not received the same real-hardware validation as Fedora/Linux.
