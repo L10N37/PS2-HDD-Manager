@@ -539,6 +539,11 @@ public:
             return QVariant();
 
         if (role == Qt::ToolTipRole) {
+            if (!gameIdScanEnabled)
+                return QStringLiteral(
+                        "Game ID scanning is disabled. Tick 'Scan Game IDs' "
+                        "above the PC pane to scan the current directory.");
+
             if (info.isDir())
                 return QStringLiteral(
                         "Fast PS2 Game ID probe: root SYSTEM.CNF or one "
@@ -551,6 +556,11 @@ public:
         if (role != Qt::DisplayRole)
             return QVariant();
 
+        // PS2_HDD_GAME_ID_SCAN_TOGGLE_V1
+        // Do absolutely no ISO/folder probing until the user opts in.
+        if (!gameIdScanEnabled)
+            return QVariant();
+
         const auto cached = gameIds.constFind(path);
         if (cached != gameIds.cend())
             return cached.value().isEmpty()
@@ -561,8 +571,61 @@ public:
         return QStringLiteral("Scanning...");
     }
 
+    void setGameIdScanEnabled(bool enabled)
+    {
+        if (gameIdScanEnabled == enabled)
+            return;
+
+        gameIdScanEnabled = enabled;
+
+        // Any in-flight workers from the previous state are stale.
+        ++scanGeneration;
+        gameIds.clear();
+        pending.clear();
+
+        emit layoutChanged();
+    }
+
+    bool isGameIdScanEnabled() const
+    {
+        return gameIdScanEnabled;
+    }
+
+    void scanDirectoryGameIds(const QModelIndex &root) const
+    {
+        if (!gameIdScanEnabled)
+            return;
+
+        const int rows = rowCount(root);
+
+        for (int row = 0; row < rows; ++row) {
+            const QModelIndex nameIndex =
+                    index(row, 0, root);
+
+            if (!nameIndex.isValid())
+                continue;
+
+            const QString path =
+                    QDir::cleanPath(
+                        filePath(nameIndex));
+
+            const QFileInfo info(path);
+
+            const bool candidate =
+                    info.isDir() ||
+                    (info.isFile() &&
+                     info.suffix().compare(
+                         QStringLiteral("iso"),
+                         Qt::CaseInsensitive) == 0);
+
+            if (candidate)
+                scheduleGameIdScan(path);
+        }
+    }
+
     void clearGameIdCache()
     {
+        ++scanGeneration;
         gameIds.clear();
         pending.clear();
         emit layoutChanged();
@@ -576,11 +639,14 @@ private:
 
         pending.insert(path);
 
+        const quint64 generation =
+                scanGeneration;
+
         QPointer<Ps2FileSystemModel> self(
                 const_cast<Ps2FileSystemModel *>(this));
 
         QThreadPool::globalInstance()->start(
-                [self, path]() {
+                [self, path, generation]() {
             const QString id =
                     identifyPathGameIdFast(path);
 
@@ -589,8 +655,10 @@ private:
 
             QMetaObject::invokeMethod(
                     self,
-                    [self, path, id]() {
-                if (!self)
+                    [self, path, id, generation]() {
+                if (!self ||
+                        !self->gameIdScanEnabled ||
+                        self->scanGeneration != generation)
                     return;
 
                 self->pending.remove(path);
@@ -620,6 +688,8 @@ private:
 
     mutable QHash<QString, QString> gameIds;
     mutable QSet<QString> pending;
+    bool gameIdScanEnabled = false;
+    quint64 scanGeneration = 0;
 };
 }
 
@@ -850,7 +920,25 @@ QWidget *MainWindow::buildPcPane()
     pcDriveCombo->setMinimumWidth(300);
     auto *up = new QPushButton("Up", group);
     auto *refresh = new QPushButton("Refresh", group);
+
+    // PS2_HDD_GAME_ID_SCAN_TOGGLE_V1
+    auto *scanGameIds =
+            new QCheckBox("Scan Game IDs", group);
+    scanGameIds->setToolTip(
+            "Off by default. When enabled, scan the current PC directory "
+            "for PS2 Game IDs and show them in the Game ID column. "
+            "Folder probing is non-recursive.");
+
+    QSettings pcScanSettings(
+            "VajskiDs",
+            "PS2-HDD-Manager");
+    scanGameIds->setChecked(
+            pcScanSettings.value(
+                "pc/scanGameIds",
+                false).toBool());
+
     toolbar->addWidget(pcDriveCombo, 1);
+    toolbar->addWidget(scanGameIds);
     toolbar->addWidget(up);
     toolbar->addWidget(refresh);
     layout->addLayout(toolbar);
@@ -860,6 +948,12 @@ QWidget *MainWindow::buildPcPane()
     pcModel = new Ps2FileSystemModel(group);
     pcModel->setFilter(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::AllDirs);
     pcModel->setRootPath(QString());
+
+    if (auto *gameIdModel =
+            dynamic_cast<Ps2FileSystemModel *>(pcModel))
+        gameIdModel->setGameIdScanEnabled(
+                scanGameIds->isChecked());
+
     pcView = new QTreeView(group);
     pcView->setModel(pcModel);
     pcView->setSelectionMode(QAbstractItemView::ExtendedSelection);
@@ -921,8 +1015,9 @@ QWidget *MainWindow::buildPcPane()
                 i,
                 QHeaderView::ResizeToContents);
     pcView->setToolTip(
-            "The Game ID column uses the PS2 Batch Renamer direct ISO algorithm. "
-            "It intentionally scans ISO files only; CHD is not an OPL HDD game format.");
+            "Tick 'Scan Game IDs' to enable the PS2 Batch Renamer direct ISO "
+            "Game ID probe for the current directory. Folder probing is "
+            "non-recursive; CHD is not an OPL HDD game format.");
     layout->addWidget(pcView, 1);
     auto *queueBar = new QHBoxLayout();
     auto *addSelectedToQueue = new QPushButton("Add Selected to Queue", group);
@@ -933,6 +1028,38 @@ QWidget *MainWindow::buildPcPane()
     queueBar->addWidget(unmarkAll);
     queueBar->addStretch();
     layout->addLayout(queueBar);
+
+    connect(scanGameIds, &QCheckBox::toggled,
+            this, [this](bool enabled) {
+        QSettings settings(
+                "VajskiDs",
+                "PS2-HDD-Manager");
+        settings.setValue(
+                "pc/scanGameIds",
+                enabled);
+
+        auto *model =
+                dynamic_cast<Ps2FileSystemModel *>(
+                    pcModel);
+
+        if (!model)
+            return;
+
+        model->setGameIdScanEnabled(
+                enabled);
+
+        if (enabled && pcView)
+            model->scanDirectoryGameIds(
+                    pcView->rootIndex());
+
+        if (pcView)
+            pcView->viewport()->update();
+
+        statusBar()->showMessage(
+                enabled
+                    ? "Game ID scanning enabled for the PC pane."
+                    : "Game ID scanning disabled; no ISO/folder probes will run.");
+    });
 
     connect(addSelectedToQueue, &QPushButton::clicked, this, [this]() {
         if (!pcView || !pcView->selectionModel())
@@ -1234,6 +1361,14 @@ void MainWindow::navigatePc(const QString &path)
     const QString absolute = QDir::cleanPath(info.absoluteFilePath());
     pcPath->setText(QDir::toNativeSeparators(absolute));
     pcView->setRootIndex(pcModel->index(absolute));
+
+    if (auto *model =
+            dynamic_cast<Ps2FileSystemModel *>(pcModel);
+            model &&
+            model->isGameIdScanEnabled())
+        model->scanDirectoryGameIds(
+                pcView->rootIndex());
+
     QSettings("VajskiDs", "PS2-HDD-Manager").setValue("pc/lastPath", absolute);
 }
 
