@@ -1009,11 +1009,21 @@ QWidget *MainWindow::buildPcPane()
     pcView->sortByColumn(0, Qt::AscendingOrder);
     pcView->setRootIsDecorated(false);
     pcView->setItemsExpandable(false);
+    // PS2_HDD_PC_COLUMN_SPACING_V2
+    // V1 widths were being overridden here by ResizeToContents.
     pcView->header()->setSectionResizeMode(0, QHeaderView::Stretch);
-    for (int i = 1; i < 5; i++)
-        pcView->header()->setSectionResizeMode(
-                i,
-                QHeaderView::ResizeToContents);
+    for (int i = 1; i < 5; ++i)
+        pcView->header()->setSectionResizeMode(i, QHeaderView::Interactive);
+
+    const QFontMetrics pcMetaMetrics(pcView->font());
+    pcView->setColumnWidth(1, std::max(110,
+            pcMetaMetrics.horizontalAdvance(QStringLiteral("999.99 MiB")) + 34));
+    pcView->setColumnWidth(2, std::max(125,
+            pcMetaMetrics.horizontalAdvance(QStringLiteral("Raw CD image")) + 34));
+    pcView->setColumnWidth(3, std::max(165,
+            pcMetaMetrics.horizontalAdvance(QStringLiteral("12/31/2099 12:59 PM")) + 36));
+    pcView->setColumnWidth(4, std::max(115,
+            pcMetaMetrics.horizontalAdvance(QStringLiteral("SLES_999.99")) + 30));
     pcView->setToolTip(
             "Tick 'Scan Game IDs' to enable the PS2 Batch Renamer direct ISO "
             "Game ID probe for the current directory. Folder probing is "
