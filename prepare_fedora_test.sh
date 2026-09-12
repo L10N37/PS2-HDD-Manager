@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# PS2 HDD Manager 0.1.0-alpha Fedora preparer.
+# PS2 HDD Manager 0.2.0 Fedora preparer.
 # Host backends are cached persistently; this script never opens a physical HDD.
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

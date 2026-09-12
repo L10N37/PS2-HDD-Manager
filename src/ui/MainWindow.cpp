@@ -1237,8 +1237,8 @@ QWidget *MainWindow::buildPs2Pane()
             "Writes a plug-and-play conf_opl.cfg: Internal HDD auto-start/default, Apps auto, "
             "cover art, write operations, game-list cache, auto-refresh and auto-sort.");
 
-    // PS2_HDD_HDD_IGR_TEST_V1
-    installHddIgrButton = new QPushButton("Install HDD IGR Return (Test)", group);
+    // PS2_HDD_HDD_IGR_RETURN_V1
+    installHddIgrButton = new QPushButton("Install HDD IGR Return", group);
     installHddIgrButton->setToolTip(
             "No format required. Copies the correct OPL payload to IGR.ELF in the current "
             "OPL PFS partition and sets exit_path to the full HDD/PFS path.");
@@ -5549,7 +5549,7 @@ void MainWindow::installOrUpdateOplApps()
 #endif
 }
 
-// PS2_HDD_HDD_IGR_TEST_V1
+// PS2_HDD_HDD_IGR_RETURN_V1
 void MainWindow::installHddIgrReturn()
 {
 #ifdef __linux__
@@ -5620,7 +5620,7 @@ void MainWindow::installHddIgrReturn()
                 : QStringLiteral("--opl");
 
     statusLabel->setText(
-            "Preparing OPL payload for direct HDD IGR test...");
+            "Preparing OPL payload for HDD IGR return...");
     QApplication::processEvents();
 
     QProcess fetch(this);
@@ -5772,14 +5772,14 @@ void MainWindow::installHddIgrReturn()
     const auto answer =
             QMessageBox::warning(
                 this,
-                "Install experimental HDD IGR return?",
+                "Install HDD IGR return?",
                 QString(
                     "This does NOT format the HDD.\n\n"
                     "It will:\n"
                     "  • copy the current OPL ELF to %1\n"
                     "  • set OPL exit_path to:\n"
                     "    %2\n\n"
-                    "Use 'Disable HDD IGR Return' to return IGR to Browser if the test fails.\n\n"
+                    "Use 'Disable HDD IGR Return' to return IGR to Browser if needed.\n\n"
                     "Continue?")
                     .arg(
                         joinPfsPath(
@@ -5830,11 +5830,11 @@ void MainWindow::installHddIgrReturn()
     refreshCurrentPs2Tree();
 
     statusLabel->setText(
-            "HDD IGR return installed for hardware testing.");
+            "HDD IGR return installed successfully.");
 
     QMessageBox::information(
             this,
-            "HDD IGR test installed",
+            "HDD IGR return installed",
             QString(
                 "IGR.ELF and conf_opl.cfg were written successfully.\n\n"
                 "Configured exit_path:\n%1\n\n"

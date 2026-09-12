@@ -42,7 +42,7 @@ Ps2HddSetupDialog::Ps2HddSetupDialog(PrivilegedSession *session, QWidget *parent
 
     auto *layout = new QVBoxLayout(this);
     auto *notice = new QLabel(
-            "0.1.0-alpha experimental 4 TB test: Extended APA Banks creates a conventional bootable Bank 0 "
+            "v0.2.0: Extended APA Banks creates a conventional bootable Bank 0 "
             "plus games-only Bank 1+. OPL/PFS/FHDB stay in Bank 0 and the GUI can target either bank. Backends "
             "and downloads are persistently cached. FHDB still requires the console EEPROM HDD-boot "
             "setting to be enabled once per console.",
@@ -56,7 +56,7 @@ Ps2HddSetupDialog::Ps2HddSetupDialog(PrivilegedSession *session, QWidget *parent
     layoutMode = new QComboBox(options);
     layoutMode->addItem("Standard APA / PFS (current OPL, up to 2 TiB)",
             static_cast<int>(Ps2::HddLayoutMode::StandardApa));
-    layoutMode->addItem("Extended APA banks (>2 TiB experimental hardware test)",
+    layoutMode->addItem("Extended APA banks (>2 TiB)",
             static_cast<int>(Ps2::HddLayoutMode::ExtendedApaBanks));
     optionLayout->addRow("Disk layout:", layoutMode);
     auto *stageInfo = new QLabel(
@@ -577,14 +577,14 @@ void Ps2HddSetupDialog::formatSelectedDisk()
         const QString destination = payloadPath + "/opl/OPNPS2LD.ELF";
         if (!QFileInfo(source).isFile()) {
             refreshButton->setEnabled(true); refreshBackendState();
-            QMessageBox::critical(this, "Bank-aware OPL missing", "Bundled bank-aware OPL test ELF is missing. Disk was not modified.");
+            QMessageBox::critical(this, "Bank-aware OPL missing", "Bundled Extended APA OPL ELF is missing. Disk was not modified.");
             return;
         }
         QDir().mkpath(QFileInfo(destination).absolutePath());
         QFile::remove(destination);
         if (!QFile::copy(source, destination)) {
             refreshButton->setEnabled(true); refreshBackendState();
-            QMessageBox::critical(this, "Bank-aware OPL staging failed", "Could not stage the bundled bank-aware OPL test ELF. Disk was not modified.");
+            QMessageBox::critical(this, "Bank-aware OPL staging failed", "Could not stage the bundled Extended APA OPL ELF. Disk was not modified.");
             return;
         }
     }
@@ -672,7 +672,7 @@ void Ps2HddSetupDialog::formatSelectedDisk()
             : "The standard APA chain and all four system PFS partitions verified successfully.";
     if (provision.installOpl)
         done += extended
-                ? "\n\nThe bundled bank-aware OPL test ELF was installed and PP.FHDB.APPS was configured as OPL's Bank-0 data/app partition."
+                ? "\n\nThe Extended APA-aware OPL build was installed and PP.FHDB.APPS was configured as OPL's Bank-0 data/app partition."
                 : "\n\nLatest OPL Beta was installed and PP.FHDB.APPS was configured as OPL's HDD data/app partition.";
     if (provision.configureOplPlugAndPlay)
         done += "\nOPL was preconfigured for automatic Internal HDD startup, HDD games as the default device, artwork, write operations, caching and auto-refresh/sort.";
