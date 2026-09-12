@@ -29,6 +29,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QFileSystemModel>
+#include <QFontMetrics>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -865,6 +866,46 @@ QWidget *MainWindow::buildPcPane()
     pcView->setContextMenuPolicy(Qt::NoContextMenu);
     pcView->viewport()->installEventFilter(this);
     pcView->setItemDelegate(new MarkedFileDelegate(pcModel, &markedPcPaths, pcView));
+
+    // PS2_HDD_PC_COLUMN_SPACING_V1
+    //
+    // QFileSystemModel's default section sizes are a little too tight for
+    // values such as "962.00 MiB" and "3/21/16 12:54 PM". They end up visually
+    // touching the next column even though the cells themselves are separate.
+    // Size these metadata columns from representative widest strings and add
+    // explicit padding. Keep every section user-resizable.
+    const QFontMetrics pcColumnMetrics(pcView->font());
+
+    const auto metadataWidth =
+            [&pcColumnMetrics](const QString &sample, int padding = 24) {
+                return pcColumnMetrics.horizontalAdvance(sample) + padding;
+            };
+
+    QHeaderView *pcHeader = pcView->header();
+    pcHeader->setSectionResizeMode(QHeaderView::Interactive);
+    pcHeader->setStretchLastSection(false);
+    pcHeader->setMinimumSectionSize(48);
+
+    // Name / Size / Type / Date Modified / Game ID.
+    pcHeader->resizeSection(
+            0,
+            140);
+
+    pcHeader->resizeSection(
+            1,
+            metadataWidth(QStringLiteral("999.99 MiB"), 18));
+
+    pcHeader->resizeSection(
+            2,
+            metadataWidth(QStringLiteral("Raw CD image"), 18));
+
+    pcHeader->resizeSection(
+            3,
+            metadataWidth(QStringLiteral("12/31/2099 12:59 PM"), 20));
+
+    pcHeader->resizeSection(
+            4,
+            metadataWidth(QStringLiteral("SLES_999.99"), 18));
     pcView->setDragEnabled(true);
     pcView->setDragDropMode(QAbstractItemView::DragOnly);
     pcView->setSelectionBehavior(QAbstractItemView::SelectRows);
