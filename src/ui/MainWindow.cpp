@@ -1020,8 +1020,12 @@ QWidget *MainWindow::buildPcPane()
             pcMetaMetrics.horizontalAdvance(QStringLiteral("999.99 MiB")) + 34));
     pcView->setColumnWidth(2, std::max(125,
             pcMetaMetrics.horizontalAdvance(QStringLiteral("Raw CD image")) + 34));
-    pcView->setColumnWidth(3, std::max(165,
-            pcMetaMetrics.horizontalAdvance(QStringLiteral("12/31/2099 12:59 PM")) + 36));
+    // PS2_HDD_PC_COLUMN_SPACING_V3
+    // QFileSystemModel is showing the normal short locale year in this pane
+    // (e.g. 9/9/24 4:56 PM). V2 sized against a four-digit year and left too
+    // much empty space, so use a representative widest short-date string.
+    pcView->setColumnWidth(3, std::max(140,
+            pcMetaMetrics.horizontalAdvance(QStringLiteral("12/31/26 12:59 PM")) + 20));
     pcView->setColumnWidth(4, std::max(115,
             pcMetaMetrics.horizontalAdvance(QStringLiteral("SLES_999.99")) + 30));
     pcView->setToolTip(
