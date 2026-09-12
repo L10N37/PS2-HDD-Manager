@@ -91,6 +91,7 @@ struct Options
         << "  --payload-dir PATH       Downloaded payload root.\n"
         << "  --install-opl            Install current OPNPS2LD.ELF and configure OPL HDD storage.\n"
         << "  --configure-opl          Write plug-and-play internal-HDD conf_opl.cfg defaults.\n"
+        << "  --install-hdd-igr        Install /OPL/IGR.ELF and point OPL exit_path to it.\n"
         << "  --install-wle            Install current normal wLaunchELF_ISR BOOT.ELF.\n"
         << "  --install-mca            Install Memory Card Annihilator in OPL Apps.\n"
         << "  --install-fceumm         Install FCEUmm-PS2 SMB and HDD ROM/SAVE paths.\n"
@@ -110,6 +111,7 @@ Options parseOptions(int argc, char **argv)
             usage(argv[0]);
         if (argument == "--install-opl") { options.provision.installOpl = true; continue; }
         if (argument == "--configure-opl") { options.provision.configureOplPlugAndPlay = true; continue; }
+        if (argument == "--install-hdd-igr") { options.provision.installHddIgrReturn = true; continue; }
         if (argument == "--install-wle") { options.provision.installWlaunchElf = true; continue; }
         if (argument == "--install-mca") { options.provision.installMemoryCardAnnihilator = true; continue; }
         if (argument == "--install-fceumm") { options.provision.installFceumm = true; continue; }
@@ -267,6 +269,10 @@ Options parseOptions(int argc, char **argv)
     if ((listPfsMode || copyPfsMode || coverArtMode) && (options.pfsPartition.empty() || options.pfsPath.find('\n') != std::string::npos))
         usage(argv[0]);
     if (options.bank < -1 || options.bank >= static_cast<int>(Ps2::HddLayoutPlanner::MaximumBankCount))
+        usage(argv[0]);
+    if (options.provision.installHddIgrReturn &&
+            (!options.provision.installOpl ||
+             !options.provision.configureOplPlugAndPlay))
         usage(argv[0]);
     return options;
 }
@@ -2931,6 +2937,8 @@ void stageProvisionPayloads(const Options &options, const fs::path &staging)
 
     if (options.provision.installOpl)
         copyRequired(root / "opl/OPNPS2LD.ELF", staging / "OPNPS2LD.ELF");
+    if (options.provision.installHddIgrReturn)
+        copyRequired(root / "opl/OPNPS2LD.ELF", staging / "IGR.ELF");
     if (options.provision.installWlaunchElf)
         copyRequired(root / "wle/BOOT.ELF", staging / "WLE_BOOT.ELF");
     if (options.provision.installHddBootEnabler)
@@ -2977,9 +2985,14 @@ void stageProvisionPayloads(const Options &options, const fs::path &staging)
                     options.provision.installMemoryCardAnnihilator ||
                     options.provision.installHddBootEnabler ||
                     options.provision.installFceumm;
-            // Deliberately leave exit_path unset here. Current OPL's in-game reset
-            // loader does not initialize HDD/PFS before loading a custom exit ELF,
-            // so a direct hdd0:...:pfs:/OPL path is not a safe default.
+
+            // PS2_HDD_FORMAT_IGR_DEFAULT_V1
+            // Direct HDD IGR return was hardware-validated on the managed
+            // PP.FHDB.APPS layout. The same OPL payload is staged as IGR.ELF.
+            if (options.provision.installHddIgrReturn)
+                preset.exitPath =
+                        "hdd0:PP.FHDB.APPS:pfs:/OPL/IGR.ELF";
+
             writeText(staging / "conf_opl.cfg", Ps2::OplConfig::BuildInternalHddPreset(preset));
         }
     }

@@ -54,6 +54,7 @@ private:
     QComboBox *layoutMode = nullptr;
     QCheckBox *installOplCheck = nullptr;
     QCheckBox *configureOplCheck = nullptr;
+    QCheckBox *installHddIgrCheck = nullptr;
     QCheckBox *installWleCheck = nullptr;
     QCheckBox *installMcaCheck = nullptr;
     QCheckBox *installFceummCheck = nullptr;

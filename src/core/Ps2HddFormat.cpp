@@ -124,7 +124,7 @@ PayloadStatus Ps2HddFormat::ValidateProvisionPayload(const std::string &payloadD
     }
 
     std::vector<fs::path> required;
-    if (selection.installOpl)
+    if (selection.installOpl || selection.installHddIgrReturn)
         required.emplace_back("opl/OPNPS2LD.ELF");
     if (selection.installWlaunchElf)
         required.emplace_back("wle/BOOT.ELF");
@@ -239,6 +239,8 @@ std::string Ps2HddFormat::BuildProvisionScript(const std::string &devicePath,
         script += "lcd " + stagingDirectory + "\n";
         if (selection.installOpl)
             script += "put OPNPS2LD.ELF\n";
+        if (selection.installHddIgrReturn)
+            script += "put IGR.ELF\n";
         if (selection.configureOplPlugAndPlay)
             script += "put conf_opl.cfg\n";
 

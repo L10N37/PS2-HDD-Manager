@@ -24,6 +24,7 @@ struct ProvisioningSelection
     bool installMemoryCardAnnihilator = false;
     bool installFceumm = false;
     bool configureOplPlugAndPlay = false;
+    bool installHddIgrReturn = false;
 
     bool any() const
     {
@@ -33,7 +34,8 @@ struct ProvisioningSelection
                 installHddBootEnabler ||
                 installMemoryCardAnnihilator ||
                 installFceumm ||
-                configureOplPlugAndPlay;
+                configureOplPlugAndPlay ||
+                installHddIgrReturn;
     }
 
     bool needsAppsPartition() const
@@ -43,7 +45,8 @@ struct ProvisioningSelection
                 installHddBootEnabler ||
                 installMemoryCardAnnihilator ||
                 installFceumm ||
-                configureOplPlugAndPlay;
+                configureOplPlugAndPlay ||
+                installHddIgrReturn;
     }
 };
 

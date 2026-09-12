@@ -74,7 +74,17 @@ Ps2HddSetupDialog::Ps2HddSetupDialog(PrivilegedSession *session, QWidget *parent
     configureOplCheck = new QCheckBox(
             "Preconfigure OPL for Internal HDD: auto-start HDD, start on HDD games, cover art, write ops, cache and autosort/autorefresh", provision);
     configureOplCheck->setChecked(true);
-    configureOplCheck->setToolTip("Writes conf_opl.cfg directly so the first OPL boot is already configured for an internal-HDD build. A direct HDD/PFS IGR exit path is deliberately not forced because stock OPL's IGR loader does not initialize HDD/PFS before loading an exit ELF.");
+    configureOplCheck->setToolTip(
+            "Writes conf_opl.cfg directly so the first OPL boot is already configured for an internal-HDD build.");
+
+    // PS2_HDD_FORMAT_IGR_DEFAULT_V1
+    installHddIgrCheck = new QCheckBox(
+            "Install HDD IGR Return (recommended)", provision);
+    installHddIgrCheck->setChecked(true);
+    installHddIgrCheck->setToolTip(
+            "Copies the same matching OPL build to /OPL/IGR.ELF and preconfigures "
+            "exit_path=hdd0:PP.FHDB.APPS:pfs:/OPL/IGR.ELF. "
+            "This direct HDD return path was hardware-validated before release.");
 
     appsStorageSize = new QComboBox(provision);
     appsStorageSize->addItem("512 MiB", 512);
@@ -124,6 +134,7 @@ Ps2HddSetupDialog::Ps2HddSetupDialog(PrivilegedSession *session, QWidget *parent
 
     provisionLayout->addRow(QString(), installOplCheck);
     provisionLayout->addRow(QString(), configureOplCheck);
+    provisionLayout->addRow(QString(), installHddIgrCheck);
     provisionLayout->addRow(
             "Apps / ART / ROMS reserve:",
             appsStorageSize);
@@ -141,6 +152,25 @@ Ps2HddSetupDialog::Ps2HddSetupDialog(PrivilegedSession *session, QWidget *parent
     fhdbWarning->setWordWrap(true);
     provisionLayout->addRow(QString(), fhdbWarning);
     layout->addWidget(provision);
+
+    const auto updateIgrSetupOption = [this]() {
+        const bool available =
+                installOplCheck->isChecked() &&
+                configureOplCheck->isChecked();
+        installHddIgrCheck->setEnabled(available);
+        if (!available)
+            installHddIgrCheck->setChecked(false);
+    };
+
+    connect(installOplCheck, &QCheckBox::toggled,
+            this, [updateIgrSetupOption](bool) {
+        updateIgrSetupOption();
+    });
+    connect(configureOplCheck, &QCheckBox::toggled,
+            this, [updateIgrSetupOption](bool) {
+        updateIgrSetupOption();
+    });
+    updateIgrSetupOption();
 
     connect(createFreeDvdBootCheck, &QCheckBox::toggled, this, [this](bool checked) {
         freeDvdBootProfile->setEnabled(checked);
@@ -233,6 +263,7 @@ Ps2::ProvisioningSelection Ps2HddSetupDialog::provisioningSelection() const
     Ps2::ProvisioningSelection selection;
     selection.installOpl = installOplCheck->isChecked();
     selection.configureOplPlugAndPlay = configureOplCheck->isChecked();
+    selection.installHddIgrReturn = installHddIgrCheck->isChecked();
     selection.installWlaunchElf = installWleCheck->isChecked();
     selection.installMemoryCardAnnihilator =
             installMcaCheck->isChecked();
@@ -248,6 +279,7 @@ QString Ps2HddSetupDialog::provisioningSummary() const
     QStringList selected;
     if (installOplCheck->isChecked()) selected << "latest OPL Beta";
     if (configureOplCheck->isChecked()) selected << "plug-and-play OPL configuration";
+    if (installHddIgrCheck->isChecked()) selected << "HDD IGR return to OPL";
     if (installWleCheck->isChecked()) selected << "wLaunchELF_ISR";
     if (installMcaCheck->isChecked())
         selected << "Memory Card Annihilator";
@@ -569,6 +601,7 @@ void Ps2HddSetupDialog::formatSelectedDisk()
         arguments << "--payload-dir" << payloadPath;
         if (provision.installOpl) arguments << "--install-opl";
         if (provision.configureOplPlugAndPlay) arguments << "--configure-opl";
+        if (provision.installHddIgrReturn) arguments << "--install-hdd-igr";
         if (provision.installWlaunchElf) arguments << "--install-wle";
         if (provision.installMemoryCardAnnihilator)
             arguments << "--install-mca";
@@ -641,7 +674,10 @@ void Ps2HddSetupDialog::formatSelectedDisk()
         done += extended
                 ? "\n\nThe bundled bank-aware OPL test ELF was installed and PP.FHDB.APPS was configured as OPL's Bank-0 data/app partition."
                 : "\n\nLatest OPL Beta was installed and PP.FHDB.APPS was configured as OPL's HDD data/app partition.";
-    if (provision.configureOplPlugAndPlay) done += "\nOPL was preconfigured for automatic Internal HDD startup, HDD games as the default device, artwork, write operations, caching and auto-refresh/sort. IGR exit_path was left at OPL's safe default.";
+    if (provision.configureOplPlugAndPlay)
+        done += "\nOPL was preconfigured for automatic Internal HDD startup, HDD games as the default device, artwork, write operations, caching and auto-refresh/sort.";
+    if (provision.installHddIgrReturn)
+        done += "\nHDD IGR return was preinstalled as /OPL/IGR.ELF and OPL exit_path was pointed to the managed HDD copy.";
     if (provision.installWlaunchElf) done += "\nLatest normal wLaunchELF_ISR was installed.";
     if (provision.installMemoryCardAnnihilator) done += "\nMemory Card Annihilator was installed in OPL Apps.";
     if (provision.installHddBootEnabler) done += "\nThe dedicated FHDB HDD Boot Configuration utility was installed in OPL Apps.";
