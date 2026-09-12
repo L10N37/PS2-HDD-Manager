@@ -516,6 +516,23 @@ public:
             const QModelIndex &index,
             int role = Qt::DisplayRole) const override
     {
+        // PS2_HDD_PC_PADDED_DATES_V1
+        // Keep QFileSystemModel behaviour, but present Date Modified with
+        // zero-padded month/day so the column lines up visually:
+        // 09/09/26 4:56 PM instead of 9/9/26 4:56 PM.
+        if (index.isValid() &&
+                index.column() == 3 &&
+                role == Qt::DisplayRole) {
+            const QModelIndex nameIndex =
+                    index.sibling(index.row(), 0);
+            const QFileInfo info(
+                    filePath(nameIndex));
+
+            if (info.exists())
+                return info.lastModified().toString(
+                        QStringLiteral("MM/dd/yy h:mm AP"));
+        }
+
         if (!index.isValid() || index.column() != 4)
             return QFileSystemModel::data(index, role);
 
