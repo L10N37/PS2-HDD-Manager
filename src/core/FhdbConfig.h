@@ -28,7 +28,6 @@ public:
     std::string Serialize() const;
     std::string Value(const std::string &key) const;
     void SetValue(const std::string &key, const std::string &value);
-    void RemoveValue(const std::string &key);
 
     std::vector<FhdbMenuItem> MenuItems() const;
     void SetMenuItems(const std::vector<FhdbMenuItem> &items);

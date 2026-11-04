@@ -151,6 +151,14 @@ FHDB HDD Boot Configuration, recommended OPL settings, HDD IGR return and OPL ar
 
 See `PROVISIONING.md`.
 
+## Building on Arch Linux
+
+```bash
+sudo pacman -S --needed base-devel gcc cmake ninja qt6-base pkgconf
+./build_arch.sh
+./build/arch/PS2-HDD-Manager
+```
+
 ## Building on Fedora
 
 ```bash

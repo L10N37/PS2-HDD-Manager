@@ -21,7 +21,6 @@ public:
     bool unlock(QWidget *dialogParent = nullptr);
     void lock();
     bool isUnlocked() const;
-    bool isBusy() const { return busy; }
     QString lastError() const { return errorText; }
 
     // Runs one existing PS2-HDD-Writer CLI operation through the already

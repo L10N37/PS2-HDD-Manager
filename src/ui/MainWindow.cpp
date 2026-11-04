@@ -761,6 +761,29 @@ QString MainWindow::formatBytes(std::uint64_t bytes)
             QString::number(value, 'f', 2) + " " + suffixes[suffix];
 }
 
+QString MainWindow::formatDuration(std::int64_t totalSeconds)
+{
+    if (totalSeconds < 0)
+        return QStringLiteral("--:--");
+
+    const std::int64_t hours = totalSeconds / 3600;
+    const std::int64_t minutes = (totalSeconds % 3600) / 60;
+    const std::int64_t seconds = totalSeconds % 60;
+
+    if (hours > 0) {
+        return QString("%1h %2m %3s")
+                .arg(hours)
+                .arg(minutes, 2, 10, QChar('0'))
+                .arg(seconds, 2, 10, QChar('0'));
+    }
+    if (minutes > 0) {
+        return QString("%1 min, %2 sec")
+                .arg(minutes)
+                .arg(seconds);
+    }
+    return QString("%1 sec").arg(seconds);
+}
+
 QString MainWindow::joinPfsPath(const QString &base, const QString &name)
 {
     QString result = base;
@@ -769,13 +792,6 @@ QString MainWindow::joinPfsPath(const QString &base, const QString &name)
     result += name;
     result.replace(QRegularExpression("/{2,}"), "/");
     return result;
-}
-
-QString MainWindow::pfsParentPath(const QString &path)
-{
-    if (path.isEmpty() || path == "/") return "/";
-    const int slash = path.lastIndexOf('/');
-    return slash <= 0 ? "/" : path.left(slash);
 }
 
 bool MainWindow::unlockHddSession(bool showFailure)
@@ -3479,6 +3495,7 @@ void MainWindow::resetProgress()
         overallProgress->setProperty("queueCurrentBytes", QVariant());
         overallProgress->setProperty("queueGameIndex", QVariant());
         overallProgress->setProperty("queueGameCount", QVariant());
+        overallProgress->setProperty("lastSpeedMBs", QVariant());
         overallProgress->setVisible(false);
     }
     if (overallProgressDetail) {
@@ -3529,12 +3546,13 @@ void MainWindow::parseTransferProgress(const QString &text, const QString &prefi
                 overallProgress->property("queueGameCount").toInt();
 
         int overallPc = 0;
+        qulonglong processedBytes = completedBytes;
         if (totalBytes > 0) {
-            const qulonglong weighted =
-                    completedBytes * 100ULL +
-                    currentBytes * static_cast<qulonglong>(currentPc);
+            const qulonglong currentProcessed =
+                    (currentBytes * static_cast<qulonglong>(currentPc)) / 100ULL;
+            processedBytes += currentProcessed;
             overallPc = static_cast<int>(
-                    std::min<qulonglong>(100ULL, weighted / totalBytes));
+                    std::min<qulonglong>(100ULL, (processedBytes * 100ULL) / totalBytes));
         }
 
         overallProgress->setRange(0, 100);
@@ -3542,11 +3560,84 @@ void MainWindow::parseTransferProgress(const QString &text, const QString &prefi
         overallProgress->setFormat(QString("Overall %1%").arg(overallPc));
         overallProgress->setVisible(true);
 
+        const double currentSpeedMBs = last.captured(3).toDouble();
+        if (currentSpeedMBs > 0.05) {
+            overallProgress->setProperty("lastSpeedMBs", currentSpeedMBs);
+        }
+
+        const double effectiveSpeedMBs = currentSpeedMBs > 0.05
+                ? currentSpeedMBs
+                : overallProgress->property("lastSpeedMBs").toDouble();
+
+        const QString currentRemainingText = last.captured(2).trimmed();
+        qint64 currentRemainingSec = 0;
+        {
+            static const QRegularExpression minRe(R"((\d+)\s*min)");
+            static const QRegularExpression secRe(R"((\d+)\s*sec)");
+            static const QRegularExpression clockRe(R"((\d+):(\d{2})(?::(\d{2}))?)");
+            auto mClock = clockRe.match(currentRemainingText);
+            if (mClock.hasMatch()) {
+                if (!mClock.captured(3).isEmpty()) {
+                    currentRemainingSec = mClock.captured(1).toLongLong() * 3600 +
+                                          mClock.captured(2).toLongLong() * 60 +
+                                          mClock.captured(3).toLongLong();
+                } else {
+                    currentRemainingSec = mClock.captured(1).toLongLong() * 60 +
+                                          mClock.captured(2).toLongLong();
+                }
+            } else {
+                auto mMin = minRe.match(currentRemainingText);
+                if (mMin.hasMatch())
+                    currentRemainingSec += mMin.captured(1).toLongLong() * 60;
+                auto mSec = secRe.match(currentRemainingText);
+                if (mSec.hasMatch())
+                    currentRemainingSec += mSec.captured(1).toLongLong();
+            }
+        }
+
+        QString etaString;
+        const qulonglong completedPlusCurrent = completedBytes + currentBytes;
+        const qulonglong upcomingBytes = (totalBytes > completedPlusCurrent)
+                ? (totalBytes - completedPlusCurrent)
+                : 0ULL;
+
+        if (upcomingBytes == 0 && !currentRemainingText.isEmpty() && currentRemainingText != "0 sec") {
+            // When installing a single game or reaching the final queued game,
+            // the overall remaining timer must exactly match the current game's timer.
+            etaString = QString(" — %1 remaining").arg(currentRemainingText);
+        } else if (totalBytes > processedBytes) {
+            const qulonglong remainingBytes = totalBytes - processedBytes;
+            qint64 totalRemainingSec = -1;
+
+            const qulonglong currentRemainingBytes = currentBytes > 0
+                    ? (currentBytes * static_cast<qulonglong>(100 - currentPc)) / 100ULL
+                    : 0ULL;
+
+            if (currentRemainingSec > 0 && currentRemainingBytes > 0) {
+                const double bytesPerSec = static_cast<double>(currentRemainingBytes) /
+                                           static_cast<double>(currentRemainingSec);
+                if (bytesPerSec > 0.0) {
+                    const qint64 upcomingSec = static_cast<qint64>(upcomingBytes / bytesPerSec);
+                    totalRemainingSec = currentRemainingSec + upcomingSec;
+                }
+            }
+
+            if (totalRemainingSec < 0 && effectiveSpeedMBs > 0.05) {
+                const double bytesPerSec = effectiveSpeedMBs * 1024.0 * 1024.0;
+                totalRemainingSec = static_cast<qint64>(remainingBytes / bytesPerSec);
+            }
+
+            if (totalRemainingSec >= 0) {
+                etaString = QString(" — %1 remaining").arg(formatDuration(totalRemainingSec));
+            }
+        }
+
         overallProgressDetail->setText(
-                QString("OVERALL — %1% — game %2 of %3")
+                QString("OVERALL — %1% — game %2 of %3%4")
                         .arg(overallPc)
                         .arg(gameIndex)
-                        .arg(gameCount));
+                        .arg(gameCount)
+                        .arg(etaString));
         overallProgressDetail->setVisible(true);
     }
 }
@@ -3859,8 +3950,6 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
     // so the physical disk size is an optimistic upper bound.
     constexpr qulonglong QueueWarningMiB =
             1024ULL * 1024ULL;
-    constexpr qulonglong QueueWarningChunk =
-            128ULL * QueueWarningMiB;
 
     qulonglong estimatedApaBytes = 0;
 
@@ -4669,11 +4758,22 @@ void MainWindow::installGameFiles(const QStringList &inputPaths)
 
         overallProgress->setValue(overallPc);
         overallProgress->setFormat(QString("Overall %1%").arg(overallPc));
+
+        QString etaString;
+        const double effectiveSpeedMBs = overallProgress->property("lastSpeedMBs").toDouble();
+        if (effectiveSpeedMBs > 0.05 && totalBytes > completedBytes) {
+            const qulonglong remainingBytes = totalBytes - completedBytes;
+            const double bytesPerSec = effectiveSpeedMBs * 1024.0 * 1024.0;
+            const qint64 remainingSec = static_cast<qint64>(remainingBytes / bytesPerSec);
+            etaString = QString(" — %1 remaining").arg(formatDuration(remainingSec));
+        }
+
         overallProgressDetail->setText(
-                QString("OVERALL — %1% — %2 of %3 games processed")
+                QString("OVERALL — %1% — %2 of %3 games processed%4")
                         .arg(overallPc)
                         .arg(index + 1)
-                        .arg(static_cast<qulonglong>(games.size())));
+                        .arg(static_cast<qulonglong>(games.size()))
+                        .arg(etaString));
         QApplication::processEvents();
     };
 

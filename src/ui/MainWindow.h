@@ -103,8 +103,8 @@ private:
     void parseTransferProgress(const QString &text, const QString &prefix);
 
     static QString formatBytes(std::uint64_t bytes);
+    static QString formatDuration(std::int64_t seconds);
     static QString joinPfsPath(const QString &base, const QString &name);
-    static QString pfsParentPath(const QString &path);
 
     QFileSystemModel *pcModel = nullptr;
     QTreeView *pcView = nullptr;
@@ -137,11 +137,6 @@ private:
     QString currentOplBase;
     QSet<QString> markedPcPaths;
     QHash<QString, int> queuedPcBanks;
-    quint64 batchTotalBytes = 0;
-    quint64 batchCompletedBytes = 0;
-    quint64 batchCurrentBytes = 0;
-    int batchCurrentIndex = 0;
-    int batchGameCount = 0;
     PrivilegedSession *privilegedSession = nullptr;
     QNetworkAccessManager *network = nullptr;
 

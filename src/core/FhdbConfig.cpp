@@ -151,13 +151,6 @@ void FhdbConfig::SetValue(const std::string &key, const std::string &value)
         lines.push_back(assignment(key, value));
 }
 
-void FhdbConfig::RemoveValue(const std::string &key)
-{
-    lines.erase(std::remove_if(lines.begin(), lines.end(), [&key](const Line &line) {
-        return line.assignment && line.key == key;
-    }), lines.end());
-}
-
 bool FhdbConfig::parseMenuKey(const std::string &key, int &index, int &field)
 {
     static const std::string namePrefix = "name_OSDSYS_ITEM_";
